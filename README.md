@@ -1,4 +1,7 @@
-# GlowingTree's Server Little Plugins
+# GlowingTree's Little Plugins [Reupload]
+
+由于使用原账号 [@GlowingTree880](https://github.com/GlowingTree880) 于 2026 年 3 月在海鲜市场购买 Copilot 会员, 加入资质不足的企业, 几天后被官方一锅端全体封禁, 导致原账号永久封禁无法使用, 故由新账号 [@GlowingTreee](https://github.com/GlowingTreee) 重新上传仓库并进行后续更新工作
+> The original account [@GlowingTree880](https://github.com/GlowingTree880) has been permanently suspended after purchasing GitHub Copilot subscription through XianYu in March 2026, and the account was added to an illegitimate organization. GitHub later issued a mass ban on the entire organization and all its member accounts, which led to the permanent inaccessibility of the original account. So all repositories from the original account are re-uploaded and will be continuously maintained by this new account [@GlowingTreee](https://github.com/GlowingTreee).
 
 - 这里是一个存放着一些自用，因为个人突发奇想或好友建议而制作的 L4D2 插件的小仓库，将会不间断上传包含服务器功能，游戏玩法等多种类型的插件
 - 刚刚开始学着写 L4D2 的插件，可能只注重实现了功能而忽略了架构和其他的一些方面，还可能会有非常非常多的 Bug，目前还在向大佬学习中，如果发现了 Bug 欢迎向我提出哦( ･ω< )
