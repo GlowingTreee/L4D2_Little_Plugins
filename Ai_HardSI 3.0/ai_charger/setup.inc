@@ -18,8 +18,11 @@
 #define SIG_IS_CHARGE_BLOCKED 				"Charger::IsChargeBlocked"
 #define SIG_PATH_FOLLOWER_UPDATE			"PathFollower::Update"
 #define SIG_NEXTBOT_GET_COMBAT_CHARACTER 	"INextBot::GetNextBotCombatCharacter"
+#define OFFSET_PATH_FOLLOWER_GOAL			"PathFollower::m_goal"
 #define SIG_PATH_GET_CUR_GOAL				"Path::GetCurrentGoal"
+#define SIG_PATH_INVALIDATE					"Path::Invalidate"
 #define SIG_PATH_NEXT_SEGMENT				"Path::NextSegment"
+#define SIG_PATH_PRIOR_SEGMENT				"Path::PriorSegment"
 #define SIG_PATH_LAST_SEGMENT 				"Path::LastSegment"
 #define	SIG_MY_NEXTBOT_POINTER				"CBaseEntity::MyNextBotPointer"
 #define SIG_NEXTBOT_GET_LOCOMOTION			"INextBot::GetLocomotionInterface"
@@ -38,8 +41,9 @@
 #define DROP_DOWN_THRESHOLD					200.0
 #define TARGET_VULNERABLE_ADV_CHECK_DIST	250.0
 #define UNAVOIDABLE_TARGET_DIST_BUFFER		120.0
-#define STATE_TOLERANCE_DIST                50.0	// 状态转换容差距离
-#define CHARGE_Z_THRESHOLD                  120.0    // charger 冲锋时, 如果与目标的高度差超过该值, 则取消冲锋
+#define EVADE_MOVETO_REFRESH_MIN_DIST		50.0		// 目标至少移动该距离才重建 BehaviorMoveTo, 避免微小位置抖动反复寻路
+#define STATE_TOLERANCE_DIST                50.0		// 状态转换容差距离
+#define CHARGE_Z_THRESHOLD                  57.0    	// charger 冲锋时, 如果与目标的高度差超过该值, 则取消冲锋
 #define PI									3.14159265
 
 // =========================================================================
@@ -47,7 +51,8 @@
 // =========================================================================
 ConVar
 	g_cvBhop,					// 是否允许普通连跳 (STATE APPROACH 时的连跳)
-	g_cvBhopMinDist,			// 禁止的最小距离
+	g_cvBhopMinDist,			// 禁止连跳的最小距离
+	g_cvDirectBhopDist,			// 朝着目标直线连跳的最小距离
 	g_cvBhopMaxDist,			// 允许连跳的最大距离
 	g_cvBhopMinSpeed,			// 允许连跳的最小速度
 	g_cvBhopMaxSpeed,			// 连跳的最大速度
@@ -71,6 +76,7 @@ ConVar
 	g_cvProbChargeChkDur,		// 概率冲锋时的检测间隔
 	g_cvProbChargeProb,			// 概率冲锋的概率到达这个数值可冲锋
 	g_cvAntiRetreat,			// 是否阻止 charger 逃跑
+	g_cvEvadeMoveToRefreshInterval,	// ChargerEvade 生成的 BehaviorMoveTo 目标坐标刷新间隔
 	g_cvPathLookAheadMaxDepth;	// 向前搜索 PathSegment 的最大深度
 
 // =========================================================================
@@ -88,20 +94,20 @@ enum SegmentType {
 }
 
 enum struct PathSegment {
-	Address m_pPathSegment;	// 指向该 PathSegment 结构体的指针
-	Address m_pNavArea;		// 指向该 NavArea 的指针
-	int m_iNavTraverseType;	// 如何从上一个 PathSegment 到该 PathSegment 的移动方式
-	float m_vecGoalPos[3];	// 目标点
+	Address m_pPathSegment;			// 指向该 PathSegment 结构体的指针
+	Address m_pNavArea;				// 指向该 NavArea 的指针
+	int m_iNavTraverseType;			// 如何从上一个 PathSegment 到该 PathSegment 的移动方式
+	float m_vecGoalPos[3];			// 目标点
 	SegmentType m_SegmentType;		// 如何移动到该 PathSegment
-	float m_vecForward[3];	// 路径前进方向
-	float m_flLength;		// 路径长度
-	float m_flDistFromStart;	// 当前 PathSegment 到起始点的距离
+	float m_vecForward[3];			// 路径前进方向
+	float m_flLength;				// 路径长度
+	float m_flDistFromStart;		// 当前 PathSegment 到起始点的距离
 
 	void init() {
 		this.m_pPathSegment = Address_Null;
 		this.m_pNavArea = Address_Null;
-		this.m_vecGoalPos = NULL_VECTOR;
-		this.m_vecForward = NULL_VECTOR;
+		ZeroVector(this.m_vecGoalPos);
+		ZeroVector(this.m_vecForward);
 	}
 }
 
@@ -135,8 +141,11 @@ enum struct AirStrafe {
 
 enum BhopType {
 	BhopType_None,
-	BhopType_Path,
-	BhopType_Normal,
+	BhopType_Path,				// 沿着 Path 进行连跳
+	BhopType_DirectCandidate,	// 距离目标小于直线连跳阈值, 但还在验证路径是否安全
+	BhopType_Normal,			// 朝着目标直线连跳
+	BhopType_BaitRetreat,		// 近战 Bait 状态中正在执行向后跳
+	BhopType_Repathing,			// 已经到达当前 Path 末尾, 正在重新找一条新的 Path (c4m2 楼梯口, 当前 Path 末端在楼梯口, 但是 Charger 应该从旁边绕过来)
 	BhopType_Size
 }
 
@@ -145,36 +154,47 @@ enum struct AiCharger {
 	int m_iBetterTarget;				// 更好的目标 userId
 	bool m_bChargeDelayed;				// 目前冲撞能力是否被人为延时
 	bool m_bHasAirBreaked;				// 在空中时是否急停过了
-	bool m_bMove2NewTarget;				// 移动到目标时是否找到了更近的目标
 	bool m_bBhopBeforeCharge;			// 冲锋之前是否进行了最后一次连跳
+	bool m_bEvadeMoveCommandActive;	// ChargerEvade 是否已经下发 BOT_CMD_MOVE 追击命令
 	
 	float m_flLastHopSpeed;				// 上次起跳的速度
+	float m_flFinalBhopStartTime;		// 冲锋前最后一次连跳开始时间, 用于短暂等待落地/进入 commit range
 	float m_flLastLookAheadTime;		// 上次节点前向遍历时间
 	float m_flLastAirVecModifyTime;		// 上次目标修正时间
 	float m_flLastProbChargeChkTime;	// 上次概率冲锋的检测时间
+	float m_flLastVisibleTime;			// 当前状态中上次看到目标的时间
+	float m_flLastEvadeMoveToCheckTime;	// 上次检查 BehaviorMoveTo 目标坐标是否过期的时间
+	float m_vecEvadeMoveToPos[3];		// 当前 BehaviorMoveTo 创建时使用的目标坐标
 	Address m_pPathFollower;			// Path Follower 的指针, 用于前瞻 Goal Pos
-	Address m_pNextBot;					// 当前 Charger 对应的 NextBot 的指针
 	PathSegment m_PathSegment;			// Charger 当前 NextBot 寻路的 PathSegment
 	PathSegment m_NextPathSegment;		// 当前 PathSegment 的下一个 PathSegment
 	PathSegment m_LastPathSegment;		// Charger 当前 NextBot 寻路的当前路径最后一个 PathSegment
 	float m_vecAirCorrGoal[3];			// 空中速度修正的前瞻目标点 (一跳内最远且无障碍的 segment goal)
-	bool m_bHasPotentialGap;			// 当前 Charger 坐标到目标的坐标是否存在向下超过 MaxJumpHeight 的高差
 	AirStrafe m_AirStrafe;				// 连跳空中侧向偏移数据
 	BhopType m_BhopType;				// 连跳类型 (基于 PATH 或基于目标)
+
+	float m_flPathWaitStart;			// Charger 开始等待下一次 RePath 的时间
+	float m_flLastPathInvalidateTime;	// Charger 上次 Path 人为失效时间
 
 	void init() {
 		this.m_iTarget = -1;
 		this.m_iBetterTarget = -1;
 		this.m_flLastHopSpeed = 0.0;
+		this.m_flFinalBhopStartTime = 0.0;
 		this.m_flLastLookAheadTime = 0.0;
 		this.m_flLastAirVecModifyTime = 0.0;
 		this.m_flLastProbChargeChkTime = 0.0;
+		this.m_flLastVisibleTime = 0.0;
+		this.m_bEvadeMoveCommandActive = false;
+		this.m_flLastEvadeMoveToCheckTime = 0.0;
+		ZeroVector(this.m_vecEvadeMoveToPos);
+		this.m_flPathWaitStart = -1.0;
+		this.m_flLastPathInvalidateTime = -1.0;
 		this.m_pPathFollower = Address_Null;
-		this.m_pNextBot = Address_Null;
 		this.m_PathSegment.init();
 		this.m_NextPathSegment.init();
 		this.m_LastPathSegment.init();
-		this.m_vecAirCorrGoal = NULL_VECTOR;
+		ZeroVector(this.m_vecAirCorrGoal);
 		this.m_AirStrafe.init();
 	}
 }
@@ -271,8 +291,8 @@ enum struct ChargerStateContext {
 			Call_StartFunction(INVALID_HANDLE, curState.OnUpdate);
 			Call_PushCell(GetClientOfUserId(this.userId));
 			Call_PushCellRef(buttons);
-			Call_PushArray(vel, 3);
-			Call_PushArray(ang, 3);
+			Call_PushArrayEx(vel, 3, SM_PARAM_COPYBACK);
+			Call_PushArrayEx(ang, 3, SM_PARAM_COPYBACK);
 			Call_Finish(res);
 		}
 
@@ -311,7 +331,9 @@ Handle
 	g_hSdkIsChargeBlocked,
 	g_hSdkNextBotGetCombatCharacter,
 	g_hSdkPathGetCurGoal,
+	g_hSdkPathInvalidate,
 	g_hSdkPathNextSegment,
+	g_hSdkPathPriorSegment,
 	g_hSdkPathLastSegment,
 	g_hSdkMyNextBotPointer,
 	g_hSdkGetLocomotionInterface,
@@ -321,6 +343,9 @@ Handle
 
 Handle
 	g_hPathFollowerDetour;
+
+int
+	g_iPathFollowerGoalOffset;
 
 stock void SetUp_OnModuleStart() {
 	// 初始化状态描述列表
@@ -343,6 +368,11 @@ stock void SetUp_OnAllPluginsLoaded() {
 	GameData hGameData = new GameData(GAMEDATA);
 	if (!hGameData)
 		SetFailState("Failed to load gamedata file: %s", path);
+
+	// 读取 PathFollower::m_goal 成员的偏移量 (4 * 4566)
+	g_iPathFollowerGoalOffset = hGameData.GetOffset(OFFSET_PATH_FOLLOWER_GOAL);
+	if (g_iPathFollowerGoalOffset < 0)
+		SetFailState("Failed to load offset: %s in gamedata file: %s.", OFFSET_PATH_FOLLOWER_GOAL, GAMEDATA);
 
 	// ============================================================
 	// Read SDK function 'CTerrorPlayer::GetRunTopSpeed'
@@ -400,6 +430,16 @@ stock void SetUp_OnAllPluginsLoaded() {
 		SetFailState("Failed to prep sdk call for signature %s", SIG_PATH_GET_CUR_GOAL);
 
 	// ============================================================
+	// void Path::Invalidate()
+	// ============================================================
+	StartPrepSDKCall(SDKCall_Raw);
+	if (!PrepSDKCall_SetFromConf(hGameData, SDKConf_Virtual, SIG_PATH_INVALIDATE))
+		SetFailState("Failed to load offset for signature %s", SIG_PATH_INVALIDATE);
+	g_hSdkPathInvalidate = EndPrepSDKCall();
+	if (!g_hSdkPathInvalidate)
+		SetFailState("Failed to prep sdk call for signature %s", SIG_PATH_INVALIDATE);
+
+	// ============================================================
 	// Path::Segment* NextSegment( const Path::Segment* currentSegment )
 	// given current segment, return next segment
 	// ============================================================
@@ -411,6 +451,18 @@ stock void SetUp_OnAllPluginsLoaded() {
 	g_hSdkPathNextSegment = EndPrepSDKCall();
 	if (!g_hSdkPathNextSegment)
 		SetFailState("Failed to prep sdk call for signature %s", SIG_PATH_NEXT_SEGMENT);
+
+	// ============================================================
+	// Path::PriorSegment(Path::Segment const*) const
+	// ============================================================
+	StartPrepSDKCall(SDKCall_Raw);
+	if (!PrepSDKCall_SetFromConf(hGameData, SDKConf_Virtual, SIG_PATH_PRIOR_SEGMENT))
+		SetFailState("Failed to load offset for signature %s", SIG_PATH_PRIOR_SEGMENT);
+	PrepSDKCall_SetReturnInfo(SDKType_PlainOldData, SDKPass_Plain);
+	PrepSDKCall_AddParameter(SDKType_PlainOldData, SDKPass_Plain);
+	g_hSdkPathPriorSegment = EndPrepSDKCall();
+	if (!g_hSdkPathPriorSegment)
+		SetFailState("Failed to prep sdk call for signature %s", SIG_PATH_PRIOR_SEGMENT);
 
 	// ============================================================
 	// Path::Segment* Path::LastSegment(void)

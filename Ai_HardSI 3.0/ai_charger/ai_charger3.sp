@@ -11,7 +11,7 @@
 #include <actions>
 
 // For debug print vector direction, positon
-// #include <vector_show>
+#include <vector_show>
 
 #include "./setup.inc"
 #include "./stocks.inc"
@@ -19,7 +19,6 @@
 
 // 将插件日志前缀改成自己插件的日志前缀
 #define PLUGIN_PREFIX "AI-Charger3"
-
 #define ACT_NAME_CHARGER_EVADE		"ChargerEvade"
 #define ACT_NAME_CHARGE_AT_VICTIM 	"ChargerChargeAtVictim"
 
@@ -45,6 +44,7 @@ public void OnPluginStart() {
 	// charger is allowed to bhop when its distance from the target is between [ai_charger3_bhop_min_dist, ai_charger3_bhop_max_dist], if the distance is less than this value, charger will transition to bait state
 	g_cvBhopMinDist = CreateConVar("ai_charger3_bhop_min_dist", "75.0", "禁止连跳的最小距离, 小于这个距离转换为博弈状态", CVAR_FLAGS, true, 0.0);
 	g_cvBhopMaxDist = CreateConVar("ai_charger3_bhop_max_dist", "9999.0", "允许连跳的最大距离", CVAR_FLAGS, true, 0.0);
+	g_cvDirectBhopDist = CreateConVar("ai_charger3_bhop_direct_dist", "400.0", "Charger 在接近状态中切换到朝目标方向直线连跳的距离阈值", CVAR_FLAGS, true, 0.0);
 	// the bhop impulse, when charger is allowed to bhop, each time it jumps up from the ground, it will gain a speed impulse with the value of ai_charger3_bhop_impulse
 	g_cvBhopImpulse = CreateConVar("ai_charger3_bhop_impulse", "100.0", "连跳的加速度", CVAR_FLAGS, true, 0.0);
 	// when charger's speed is greater than 'ai_charger3_bhop_min_speed', it is allowed to bhop, and its max bhop speed will not greater than 'ai_charger3_bhop_max_speed'
@@ -88,6 +88,8 @@ public void OnPluginStart() {
 	g_cvProbChargeProb = CreateConVar("ai_charger3_prob_charge_prob", "0.5", "Charger 进入博弈状态概率冲锋的概率", CVAR_FLAGS, true, 0.0);
 	// whether to prohibit charger from retreating: 0=Disabled (allow retreat), 1=Enabled (forbid retreat)
 	g_cvAntiRetreat = CreateConVar("ai_charger3_anti_retreat", "1", "是否禁止 Charger 逃跑, 0=禁止, 1=允许", CVAR_FLAGS, true, 0.0, true, 1.0);
+	// refresh interval for the target destination used by BehaviorMoveTo while ChargerEvade is intercepted
+	g_cvEvadeMoveToRefreshInterval = CreateConVar("ai_charger3_evade_moveto_refresh_interval", "1.0", "ChargerEvade 追击时检查并刷新 BehaviorMoveTo 目标坐标的间隔", CVAR_FLAGS, true, 0.1, true, 10.0);
 	// The maximum depth of path segments that charger will look ahead when it is on ground and preparing to bhop (0 = disabled). Controls how far ahead charger scans the current PATH to find suitable landing spots before hopping from ground
 	g_cvPathLookAheadMaxDepth = CreateConVar("ai_charger3_path_lookahead_maxdepth", "10", "Charger 向前搜索以当前速度可以一步到达的 PathSegment 的最大深度", CVAR_FLAGS, true, 0.0);
 
@@ -130,6 +132,9 @@ public void OnConfigsExecuted() {
 public Action OnPlayerRunCmd(int client, int& buttons, int& impulse, float vel[3], float angles[3], int& weapon) {
 	if (!isAiCharger(client))
 		return Plugin_Continue;
+
+	// BehaviorMoveTo 无法被 actions.ext 捕获, 因此从始终执行的 RunCmd 维护 BOT_CMD_MOVE 的目标坐标
+	maintainEvadeMoveCommand(client);
 
 	if (GetEntityMoveType(client) == MOVETYPE_LADDER) {
 		buttons &= ~IN_JUMP;
@@ -182,7 +187,7 @@ void evtPlayerSpawn(Event event, const char[] name, bool dontBroadcast) {
 }
 
 public void OnMapStart() {
-	// vectorShowOnMapStart();
+	vectorShowOnMapStart();
 }
 
 public void OnMapEnd() {
@@ -224,9 +229,8 @@ MRESReturn Detour_PathFollower_Update(Address pThis, Handle hParams) {
 	if (!isAiCharger(client))
 		return MRES_Ignored;
 
-	// 保存 IPathFollower 与 NextBot 指针, 用于手动触发 PathFollower::Update
+	// 保存 IPathFollower 指针, 用于路径前瞻与失效化处理
 	g_AiChargers[client].m_pPathFollower = pThis;
-	g_AiChargers[client].m_pNextBot = pNextBot;
 
 	// v37 = *((_DWORD *)this + 4566); 因为 this 被转成了 DWORD 类型, 因此后面的偏移量 4566 也是基于 4 字节的
 	static Address pPathSeg, pNextSeg, pLastSeg;
@@ -260,19 +264,246 @@ MRESReturn Detour_PathFollower_Update(Address pThis, Handle hParams) {
 		g_AiChargers[client].m_LastPathSegment = lastSegment;
 	}
 
+	// 检查落后的 m_goal；无法在剩余路径中重新定位时，无效化旧路径并等待原生 Action 重新寻路。
+	checkGoalIsBehind(client, pThis, pPathSeg);
 	return MRES_Ignored;
+}
+
+void checkGoalIsBehind(int client, Address pPathFollower, Address pCurrentSeg) {
+	if (!isAiCharger(client))
+		return;
+	if (!pPathFollower)
+		return;
+	if (!pCurrentSeg)
+		return;
+
+	PathSegment curSeg;
+	curSeg = g_AiChargers[client].m_PathSegment;
+	if (!curSeg.m_pNavArea)
+		return;
+
+	Address pLastKnownArea = L4D_GetLastKnownArea(client);
+	if (!pLastKnownArea) {
+		static float pos[3];
+		GetClientAbsOrigin(client, pos);
+		pos[2] += 20.0;
+		pLastKnownArea = view_as<Address>(L4D_GetNearestNavArea(pos, _, _, true, true, TEAM_INFECTED));
+
+		if (!pLastKnownArea) {
+			log.error("[CheckGoalIsBehind]: Failed to get client %N's LastKnownArea or nearest NavArea", client);
+			return;
+		}
+	}
+
+	/*
+	 * 原生 CheckProgress 的 LookAhead 机制可能一次跳过多个 Segment, 虽然 LookAhead Range 一般会被设置成 0, 所以是关闭的
+	 * 但是为了防止这种情况, 考虑 LookAhead 机制, 开启 LookAhead 时, LastKnownArea 位于 CurrentGoal
+	 * 之前的任意 Segment 都可能是正常状态，不能仅检查 PriorSegment
+	 */
+	static Address pPastSeg;
+	static PathSegment pastSeg;
+	pPastSeg = pCurrentSeg;
+	while (pPastSeg) {
+		constructPathSegment(pPastSeg, pastSeg);
+		if (pastSeg.m_pNavArea == pLastKnownArea)
+			return;
+
+		pPastSeg = view_as<Address>(SDKCall(g_hSdkPathPriorSegment, pPathFollower, pPastSeg));
+	}
+
+	/*
+	* 向前检查当前路径的 PathSegment, 检查 LastKnownArea 是否属于 CurrentGoal 本身或者之前的路径
+	* 如果是, 说明 Charger 正在朝着 CurrentGoal 或者已经到达了 CurrentGoal, 此时无需干预
+	*/
+	if (pPastSeg) {
+		log.debugAll("[CheckGoalIsBehind]: Aborted prior path scan for Charger %N because found a prior segment (NavId: %d) is same as LastKnownArea (NavId: %d)",
+			client, L4D_GetNavAreaID(pastSeg.m_pNavArea)), L4D_GetNavAreaID(pLastKnownArea);
+		return;
+	}
+
+	/*
+	* CurrentGoal 落后于 LastKnownArea 但是 LastKnownArea 仍然在当前 Path 上
+	* 从 CurrengSegment 开始向后扫描, 直到 LastKnownArea, 如果找到了一个 Segment 等于 LastKnownArea, 那么将 CurrentGoal 设置为 LastKnownArea 的 Segment
+	*/
+	static Address pIterSeg, pMatchedSeg;
+	pIterSeg = view_as<Address>(SDKCall(g_hSdkPathNextSegment, pPathFollower, pCurrentSeg));
+	pMatchedSeg = Address_Null;
+
+	// 从 CurrentGoal 开始向后扫描整段路径
+	while (pIterSeg) {
+		static PathSegment iterSeg;
+		constructPathSegment(pIterSeg, iterSeg);
+
+		if (iterSeg.m_pNavArea == pLastKnownArea) {
+			pMatchedSeg = pIterSeg;
+			break;
+		}
+
+		pIterSeg = view_as<Address>(SDKCall(g_hSdkPathNextSegment, pPathFollower, pIterSeg));
+	}
+
+	if (pMatchedSeg) {
+		// 进入匹配 NavArea 不代表已经越过该 Segment 的 GoalPos, 因此不再额外跳到 NextSegment
+		static Address pNewGoal;
+		pNewGoal = pMatchedSeg;
+		// 将 PathFollower::m_goal 写成当前 LastKnownArea 对应的 PathSegment 的 m_goal
+		StoreToAddress(pPathFollower + view_as<Address>(g_iPathFollowerGoalOffset), pNewGoal, NumberType_Int32);
+
+		static PathSegment newGoalSeg;
+		constructPathSegment(pNewGoal, newGoalSeg);
+		g_AiChargers[client].m_PathSegment = newGoalSeg;
+
+		static Address pNewNext;
+		pNewNext = view_as<Address>(SDKCall(g_hSdkPathNextSegment, pPathFollower, pNewGoal));
+		if (pNewNext) {
+			static PathSegment newNextSeg;
+			constructPathSegment(pNewNext, newNextSeg);
+			g_AiChargers[client].m_NextPathSegment = newNextSeg;
+		} else {
+			g_AiChargers[client].m_NextPathSegment.init();
+		}
+
+		// 重新找到了新的 CurrentGoal, 重置空中速度修正坐标
+		ZeroVector(g_AiChargers[client].m_vecAirCorrGoal);
+		g_AiChargers[client].m_AirStrafe.init();
+
+		log.debugAll("[CheckGoalIsBehind]: Advanced Charger %N goal after matching future NavArea %d", client, L4D_GetNavAreaID(pLastKnownArea));
+		return;
+	}
+
+	/*
+	* 如果 LastKnownArea 无法匹配当前 Path 上任何一个节点, 说明 Charger 已经脱离该 Path, 此时需要使旧的 Path 无效化
+	* 然后通过 ChargerAttack::Update 这个 Action 重新构造一条新的 Path
+	*/
+	SDKCall(g_hSdkPathInvalidate, pPathFollower);
+
+	g_AiChargers[client].m_PathSegment.init();
+	g_AiChargers[client].m_NextPathSegment.init();
+	g_AiChargers[client].m_LastPathSegment.init();
+	ZeroVector(g_AiChargers[client].m_vecAirCorrGoal);
+	g_AiChargers[client].m_AirStrafe.init();
+	g_AiChargers[client].m_BhopType = BhopType_None;
+
+	log.debugAll("[CheckGoalIsBehind]: Invalidated Charger %N path because LastKnownArea %d is absent from the remaining path", client, L4D_GetNavAreaID(pLastKnownArea));
+}
+
+/**
+* 将生还者当前位置解析为适合 BOT_CMD_MOVE 的 Nav 目的地。
+* 目标可能站在箱子或处于空中, 因此优先使用当前位置附近的 NavArea,
+* LastKnownArea 只作为最后回退, 避免传送后继续使用旧区域。
+*/
+stock bool getEvadeMoveDestination(int target, float movePos[3]) {
+	if (!IsValidSurvivor(target) || !IsPlayerAlive(target))
+		return false;
+
+	static float targetPos[3], navQueryPos[3];
+	GetClientAbsOrigin(target, targetPos);
+
+	static Address targetNavArea;
+	targetNavArea = L4D2Direct_GetTerrorNavArea(targetPos);
+
+	if (!targetNavArea) {
+		navQueryPos = targetPos;
+		navQueryPos[2] += 20.0;
+		targetNavArea = L4D_GetNearestNavArea(navQueryPos, _, false, true, true, TEAM_SURVIVOR);
+	}
+
+	if (!targetNavArea)
+		targetNavArea = L4D_GetLastKnownArea(target);
+
+	if (!targetNavArea)
+		return false;
+
+	L4D_GetNavAreaCenter(targetNavArea, movePos);
+	return true;
+}
+
+stock void clearEvadeMoveCommandTracking(int client) {
+	g_AiChargers[client].m_bEvadeMoveCommandActive = false;
+	g_AiChargers[client].m_flLastEvadeMoveToCheckTime = 0.0;
+	ZeroVector(g_AiChargers[client].m_vecEvadeMoveToPos);
+}
+
+stock void stopEvadeMoveCommand(int client, const char[] reason) {
+	static bool accepted;
+	accepted = L4D2_CommandABot(client, 0, BOT_CMD_RESET);
+
+	log.debugAll("[EvadeMoveCommand]: Reset Charger %N command, accepted: %d, reason: %s", client, accepted, reason);
+	clearEvadeMoveCommandTracking(client);
+}
+
+/**
+* actions.ext 无法观察 CommandABot 创建的 BehaviorMoveTo, 因此由 RunCmd 定时维护命令
+* 目标 Nav 目的地变化后只 RESET 旧的 CommandABot MOVE 命令; ChargerEvade 恢复时负责读取新坐标并重新下发 MOVE
+*/
+stock void maintainEvadeMoveCommand(int client) {
+	if (!g_AiChargers[client].m_bEvadeMoveCommandActive)
+		return;
+
+	if (!g_cvAntiRetreat.BoolValue) {
+		stopEvadeMoveCommand(client, "anti-retreat disabled");
+		return;
+	}
+
+	if (isChargerCharging(client) ||
+		IsValidSurvivor(L4D2_GetQueuedPummelVictim(client)) ||
+		IsValidSurvivor(L4D_GetVictimCharger(client)) ||
+		IsValidSurvivor(L4D_GetVictimCarry(client))
+	) {
+		stopEvadeMoveCommand(client, "charging or pinning");
+		return;
+	}
+
+	static int target;
+	target = GetClientOfUserId(g_AiChargers[client].m_iTarget);
+	if (!IsValidSurvivor(target) || !IsPlayerAlive(target)) {
+		stopEvadeMoveCommand(client, "target invalid");
+		return;
+	}
+
+	/*
+	* 检查旧的目标位置是否仍然有效, 目标移动超过 EVADE_MOVETO_REFRESH_MIN_DIST 时, 下达 BOT_CMD_RESET 恢复 Charger 原生行为
+	* 如果 ChargerEvade 继续生效, 那么会尝试获取新的目标位置, 下达 BOT_CMD_MOVE 命令
+	*/
+	static float now;
+	now = GetEngineTime();
+	if (now - g_AiChargers[client].m_flLastEvadeMoveToCheckTime < g_cvEvadeMoveToRefreshInterval.FloatValue)
+		return;
+
+	g_AiChargers[client].m_flLastEvadeMoveToCheckTime = now;
+
+	static float newMovePos[3];
+	if (!getEvadeMoveDestination(target, newMovePos)) {
+		log.debugAll("[EvadeMoveCommand]: Failed to resolve target %N's current move destination", target);
+		return;
+	}
+
+	static float movedDist;
+	movedDist = GetVectorDistance(g_AiChargers[client].m_vecEvadeMoveToPos, newMovePos);
+	if (movedDist < EVADE_MOVETO_REFRESH_MIN_DIST)
+		return;
+
+	/*
+	* 不在这里更新旧坐标或清除 active 标记。若 RESET 未生效, 下一周期仍会重试
+	* 若 RESET 生效, 恢复的 ChargerEvade 会重新下发 MOVE 并写入新坐标
+	*/
+	static bool accepted;
+	accepted = L4D2_CommandABot(client, 0, BOT_CMD_RESET);
+	log.debugAll("[EvadeMoveCommand]: Target %N destination moved %.2f units, reset Charger %N command, accepted: %d",
+		target, movedDist, client, accepted);
 }
 
 // ============================================================
 // Action Extension
 // ============================================================
-public void OnActionCreated(BehaviorAction action, int actor, const char[] name) {
+public void OnActionCreated(BehaviorAction action, int actor, const char[] name, ActionId id) {
 	if (action == INVALID_ACTION || !isAiCharger(actor))
 		return;
 
 	if (g_cvAntiRetreat.BoolValue) {
 		if (strcmp(name, ACT_NAME_CHARGER_EVADE, false) == 0) {
 			action.OnUpdate = chargerEvade_OnUpdate;
+			action.OnEnd = chargerEvade_OnEnd;
 		}
 	}
 	// 防止 charger 刷新距离生还者很近时, 游戏强制冲撞, 但是 APPROACH STATE 同时将 Charger 能力就绪时间设置为 1 秒后, 导致 Charger 原地卡住
@@ -282,52 +513,65 @@ public void OnActionCreated(BehaviorAction action, int actor, const char[] name)
 }
 
 Action chargerEvade_OnUpdate(BehaviorAction action, int actor, float interval, ActionResult result) {
-	if (!isAiCharger(actor))
+	if (!isAiCharger(actor)) {
 		return Plugin_Continue;
-	if (isChargerCharging(actor))
+	}
+	if (!g_cvAntiRetreat.BoolValue) {
+		clearEvadeMoveCommandTracking(actor);
 		return Plugin_Continue;
+	}
 	// 撞停准备控人的时候有时候会触发 Evade 行为
-	if (IsValidSurvivor(L4D2_GetQueuedPummelVictim(actor)) || IsValidSurvivor(L4D_GetVictimCharger(actor)) || IsValidSurvivor(L4D_GetVictimCarry(actor)))
+	if (isChargerCharging(actor) ||
+		IsValidSurvivor(L4D2_GetQueuedPummelVictim(actor)) ||
+		IsValidSurvivor(L4D_GetVictimCharger(actor)) ||
+		IsValidSurvivor(L4D_GetVictimCarry(actor))
+	) {
 		return Plugin_Continue;
+	}
 
 	static int target;
 	target = GetClientOfUserId(g_AiChargers[actor].m_iTarget);
-	if (!IsValidSurvivor(target)) {
-		g_AiChargers[actor].m_bMove2NewTarget = false;
+	if (!IsValidSurvivor(target) || !IsPlayerAlive(target)) {
 		return Plugin_Continue;
 	}
 	
-	static float targetPos[3];
-	GetClientAbsOrigin(target, targetPos);
-	
-	/*
-		不知道什么原因, Hook ChargerEvade 行为的 OnUpdate 函数, 并从中创建 BehaviorMoveTo 行为, OnActionCreated 不会感知到 BehaviorMoveTo 被创建, 但通过 nb_debug BEHAVIOR 可以看到 BehaviorMoveTo 行为节点已经被创建, 但是下一帧立刻被销毁, 无法通过 Smoker 那种通过 BehaviorMoveTo 直接控制 Charger 移动, 因此强行接管 ChargerEvade 行为, 使用 SdkCall 获取 INextBot 指针, 进而获取 ILocomotion 指针, 调用 Locomotion 的 Approach 和 FaceTowards 函数实现强制移动
-
-		Charger 继承自 CBaseEntity, Charger 类的指针可以向上转型成 CBaseEntity, 为了防止有时候寻路未触发, g_AiChargers[actor] 中的 pNextBot 指针无效影响该功能, 因此直接通过 SdkCall 调用 CBaseEntity::MyNextBotPointer 获取 INextBot 指针
-		执行 CBaseEntity::MyNextBotPointer() 实际上是调用实现类 NextBotCombatCharacter 的 NextBotCombatCharacter::MyNextBotPointer(NextBotCombatCharacter *this)
-	*/
-	static Address pNextBot;
-	pNextBot = view_as<Address>(SDKCall(g_hSdkMyNextBotPointer, GetEntityAddress(actor)));
-	if (!pNextBot)
+	static float movePos[3];
+	if (!getEvadeMoveDestination(target, movePos)) {
+		log.debugAll("[ChargerEvadeOnUpdate]: Failed to resolve target %N's move destination", target);
 		return Plugin_Continue;
+	}
 
-	// 获取 Locomotion 行动组件的指针
-	static Address pLocomotion;
-	pLocomotion = view_as<Address>(SDKCall(g_hSdkGetLocomotionInterface, pNextBot));
-	if (!pLocomotion)
-		return Plugin_Continue;
-	
-	// Approach & FaceTowards
-	SDKCall(g_hSdkLocomotionApproach, pLocomotion, targetPos, 1.0);
+	/* static float movePos_cpy[3];
+	movePos_cpy = movePos;
+	movePos_cpy[2] += 200.0;
+	ShowPos(COLOR_GREEN, movePos, movePos_cpy); */
+
+	g_AiChargers[actor].m_vecEvadeMoveToPos = movePos;
+	g_AiChargers[actor].m_flLastEvadeMoveToCheckTime = GetEngineTime();
+	g_AiChargers[actor].m_bEvadeMoveCommandActive = true;
+
 	/*
-		FaceTowards 的参数并不是一个单位方向向量, 而是一个需要看向的坐标点
-		传入一个坐标点 target, NextBot 的实现代码:
-			Vector look( target.x, target.y, GetBot()->GetEntity()->EyePosition().z );
-			GetBot()->GetBodyInterface()->AimHeadTowards( look, IBody::BORING, 0.1f, NULL, "Body facing" );
-		可以用 TeleportEntity 设置视角, 单纯想玩 FaceTowards
+	* accepted 大概率是 false, 不知道为什么, 使用 nb_debug BEHAVIOR 可以看到 BehaviorMoveTo << ChargerEvade << ChargerAttack
+	* 但是 actions 拓展的 OnActionCreated 却无法捕捉到 BehaviorMoveTo 的创建, 无论是 raw action 还是验证过的有效 action 都无法捕捉
 	*/
-	SDKCall(g_hSdkLocomotionFaceTo, pLocomotion, targetPos);
-	return Plugin_Handled;
+	static bool accepted;
+	accepted = L4D2_CommandABot(actor, target, BOT_CMD_MOVE, movePos);
+	log.debugAll("[ChargerEvadeOnUpdate]: CommandABot MOVE acctpted: %d", accepted);
+
+	/*
+	* 不能在这里直接 action.Done(), 因为 CommandABot 这个 Action 创建成功之后, BehaviorMoveTo 应当暂停 ChargerEvade
+	* 如果直接 Done, 那么由 ChargerEvade 派生出来的 BehaviorMoveTo 也会被跟着 ChargerEvade 释放掉
+	*/
+	return Plugin_Changed;
+}
+
+void chargerEvade_OnEnd(BehaviorAction action, int actor, BehaviorAction nextAction, ActionResult result) {
+	if (!isAiCharger(actor))
+		return;
+
+	g_AiChargers[actor].m_bEvadeMoveCommandActive = false;
+	g_AiChargers[actor].m_flLastEvadeMoveToCheckTime = 0.0;
+	ZeroVector(g_AiChargers[actor].m_vecEvadeMoveToPos);
 }
 
 Action chargerChargeAtVictim_OnUpdate(BehaviorAction action, int actor, float interval, ActionResult result) {

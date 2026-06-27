@@ -154,6 +154,37 @@ stock bool isChargeAbilityReady(int client) {
 }
 
 /**
+* 检查目标是否处在 Charger 可以冲锋的高度范围内
+* @param pos Charger 位置
+* @param targetPos 目标位置
+* @param threshold 最大允许高度差
+* @return bool, true 表示高度可冲锋, false 表示高度差过大
+**/
+stock bool isChargeHeightReachable(const float pos[3], const float targetPos[3], float threshold = CHARGE_Z_THRESHOLD) {
+    return FloatAbs(pos[2] - targetPos[2]) <= threshold;
+}
+
+/**
+* 检查目标实体是否处在 Charger 可以冲锋的高度范围内
+* @param client Charger 客户端索引
+* @param target 目标客户端索引
+* @param threshold 最大允许高度差
+* @return bool, true 表示高度可冲锋, false 表示高度差过大
+**/
+stock bool isChargeTargetHeightReachable(int client, int target, float threshold = CHARGE_Z_THRESHOLD) {
+    if (!isAiCharger(client))
+        return false;
+    if (!IsValidSurvivor(target) || !IsPlayerAlive(target))
+        return false;
+
+    static float pos[3], targetPos[3];
+    GetClientAbsOrigin(client, pos);
+    GetClientAbsOrigin(target, targetPos);
+
+    return isChargeHeightReachable(pos, targetPos, threshold);
+}
+
+/**
 * 设置 Charger 冲锋技能的冷却时间
 * @param client 客户端索引
 * @param duration 冷却剩余时间 (0.0 = 立刻就绪, 0.5 = 锁定)
@@ -986,48 +1017,144 @@ stock float calcRemainingAirTime(const float pos[3], const float vVel[3]) {
         t = 0.1;
     }
     if (t > 3.0) {
-        t > 3.0;
+        t = 3.0;
     }
 
     return t;
 }
 
-stock bool hasPotentialGap2(const float pos[3], const float targetPos[3], float maxHeight) {
-    float vDir[3];
-    MakeVectorFromPoints(pos, targetPos, vDir);
+#define DIRECT_GROUND_SAMPLE_STEP   50.0    // hasPotentialGap2 函数的从 start 到 end 路线上的采样步长
+#define DIRECT_MAX_LOCAL_STEP_UP    56.0    // 后续采样点以第一个采样点的地面高度向上或者向下 (STEP_UP + margin) 开始向下射线
+#define DIRECT_GROUND_TRACE_MARGIN  10.0
+#define DIRECT_MIN_GROUND_NORMAL_Z  0.20
 
-    NormalizeVector(vDir, vDir);
+stock bool hasPotentialGap2(int client, const float start[3], const float end[3], float maxLocalDrop) {
+    if (maxLocalDrop <= 0.0)
+        return true;
+    
+    // 从 start 到 end 只计算水平路线
+    static float routeDir[3];
+    MakeVectorFromPoints(start, end, routeDir);
+    routeDir[2] = 0.0;
 
-    float dist = GetVectorDistance(pos, targetPos);
-    // 从 vDir 方向, 起点到重点每隔 50 unit 向下采样
-    int samples = RoundToFloor(dist / 50.0);
-    if (samples < 1) samples = 1;
+    // NormalizeVector 返回归一化之前的向量长度, 同时将 routeDir 转化为单位方向向量
+    static float routeDist;
+    routeDist = NormalizeVector(routeDir, routeDir);
 
-    float vStart[3], vEnd[3];
-    for (int i = 1; i <= samples; i++) {
-        static float fraction;
-        fraction = float(i) / float(samples + 1);
-        vStart[0] = pos[0] + vDir[0] * dist * fraction;
-        vStart[1] = pos[1] + vDir[1] * dist * fraction;
-        vStart[2] = pos[2] + (targetPos[2] - pos[2]) * fraction;
+    if (routeDist <= 0.0)
+        return false;
 
-        vEnd = vStart;
-        vEnd[2] -= maxHeight;
-
-        static Handle hTrace;
-        hTrace = TR_TraceRayFilterEx(vStart, vEnd, MASK_PLAYERSOLID, RayType_Infinite, _TraceWallFilter);
-        static bool isHit;
-        isHit = TR_DidHit(hTrace);
-        delete hTrace;
-
-        if (!isHit)
-            return false;
+    int sampleCount = RoundToCeil(routeDist / DIRECT_GROUND_SAMPLE_STEP);
+    if (sampleCount < 1) {
+        sampleCount = 1;
     }
+
+    static float previousGroundZ;
+    bool hasPreviousGround;
+
+    previousGroundZ = start[2];
+    hasPreviousGround = false;
+
+    for (int sampleIndex = 0; sampleIndex <= sampleCount; sampleIndex++) {
+        static float sampleFraction;
+        sampleFraction = float(sampleIndex) / float(sampleCount);
+
+        static float samplePos[3];
+        samplePos[0] = start[0] + routeDir[0] * routeDist * sampleFraction;
+        samplePos[1] = start[1] + routeDir[1] * routeDist * sampleFraction;
+        samplePos[2] = start[2];
+
+        /*
+        * 第一个采样点以 start[2] 高度为基准, 后续采样点以上一个真实地面高度为基准
+        * 这样可以允许长斜坡之间存在很大的累计高度差, 比如中间有个坑这种, 但不允许相邻采样点之间高度差断崖式下降或者上升
+        */
+        static float referenceGroundZ;
+        referenceGroundZ = hasPreviousGround ? previousGroundZ : start[2];
+
+        static float currentGroundZ;
+        if (!tryFindGroundAtRouteSample(client, samplePos, referenceGroundZ, hasPreviousGround, maxLocalDrop, currentGroundZ)) {
+            return true;
+        }
+
+        if (hasPreviousGround) {
+            if (isLocalGroundHeightDiscontinuous(previousGroundZ, currentGroundZ, maxLocalDrop)) {
+                return true;
+            }
+        }
+
+        previousGroundZ = currentGroundZ;
+        hasPreviousGround = true;
+    }
+
+    return false;
+}
+
+stock bool tryFindGroundAtRouteSample(int client, const float samplePos[3], float referenceGroundZ, bool hasPreviousGround, float maxLocalDrop, float& outGroundZ) {
+    static float traceStart[3], traceEnd[3];
+
+    traceStart[0] = samplePos[0];
+    traceStart[1] = samplePos[1];
+
+    traceEnd[0] = samplePos[0];
+    traceEnd[1] = samplePos[1];
+
+    /*
+    * 第一个采样点, Charger 通常已经在地面上, 只需要从 start 上方向下寻找地面
+    * 后续采样点, 允许当前地面比上一个地面高 DIRECT_MAX_LOCAL_STEP_UP, 如果上升超过这个范围, 要么 trace 失败, 要么后续的高度差检查会拒绝
+    */
+    if (hasPreviousGround) {
+        traceStart[2] = referenceGroundZ + (DIRECT_MAX_LOCAL_STEP_UP + DIRECT_GROUND_TRACE_MARGIN);
+    } else {
+        traceStart[2] = referenceGroundZ + DIRECT_GROUND_TRACE_MARGIN;
+    }
+
+    /*
+    * 最低只允许下降 max local drop, 如果这个范围内找不到地面, 认为存在 Gap 或者断崖
+    */
+    traceEnd[2] = referenceGroundZ - maxLocalDrop;
+
+    static Handle hTrace;
+    hTrace = TR_TraceRayFilterEx(traceStart, traceEnd, MASK_PLAYERSOLID, RayType_EndPoint, _TraceWallFilter, client);
+
+    if (!TR_DidHit(hTrace) || TR_StartSolid(hTrace)) {
+        delete hTrace;
+        return false;
+    }
+
+    static float groundPos[3], groundNormal[3];
+    TR_GetEndPosition(groundPos, hTrace);
+    TR_GetPlaneNormal(hTrace, groundNormal);
+
+    delete hTrace;
+
+    /*
+    * GroundNormal 越接近于 1, 说明越接近水平地面, 如果 GroundNormal 接近于 0, 则说明地面倾斜严重, 无法站立
+    */
+    if (groundNormal[2] < DIRECT_MIN_GROUND_NORMAL_Z) {
+        return false;
+    }
+
+    outGroundZ = groundPos[2];
     return true;
 }
 
+stock bool isLocalGroundHeightDiscontinuous(float previousGroundZ, float currentGroundZ, float maxLocalDrop) {
+    static float deltaZ;
+    deltaZ = currentGroundZ - previousGroundZ;
+
+    if (deltaZ > DIRECT_MAX_LOCAL_STEP_UP + 1.0) {
+        return true;
+    }
+
+    if (deltaZ < -maxLocalDrop - 1.0) {
+        return true;
+    }
+
+    return false;
+}
+
 stock float calcVectorAngle(const float v1[3], const float v2[3], bool ignoreZ = true) {
-    if (IsNullVector(v1) || IsNullVector(v2))
+    if (IsZeroVector(v1) || IsZeroVector(v2))
         return 0.0;
     
     static float v1_cpy[3], v2_cpy[3];

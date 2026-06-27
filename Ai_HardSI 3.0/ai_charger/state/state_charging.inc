@@ -17,6 +17,44 @@
 #define PREDICT_MAX_TIME                        0.5     // charger 冲锋时预测目标位置的最大预测时间
 #define CHARGE_DIST_TOLERANCE                   10.0    // 开始冲锋距离容差, 500 速度冲锋目标无法躲避距离大概是 36 左右, 有点小, 导致 charger 一直连跳无法冲锋, 增加一点容差
 
+#define CHARGE_COMMIT_MIN_DIST                   36.0   // 按照 500 速度冲锋时, 允许冲锋的最小距离
+#define CHARGE_COMMIT_MAX_DIST                   95.0   // 按照 500 速度冲锋时, 允许冲锋的最大距离
+#define CHARGE_HIT_WIDTH                         16.0   // 冲锋命中宽度, 目标左右水平移动不超过这个范围可以被冲锋命中
+#define CHARGE_SIDE_SPEED_MIN                    80.0   // 生还者横向移动速度假设的最小值 (由于计算 commitDist 时需要使用横向速度做除法, 防止除零异常, 设置一个最小值)
+#define CHARGE_SPEED_EFFECTIVE_FACTOR            0.75   // 计算有效冲锋速度的因子 effective charge speed = max charge speed * factor
+#define CHARGE_DIR_EPSILON                       50.0   // XY 距离小于该值时认为水平冲锋方向退化
+#define CHARGE_COMMIT_GRACE_DIST                 10.0   // 最后一跳后落在 (commit range + 这个值) 的范围内时, 允许冲锋, 避免因为落在 commit range 外一点然后下一帧直接退回 Approach
+#define CHARGE_FINAL_HOP_GRACE_TIME              0.50   // 最后一跳预计落地时间后的额外等待时间, 然后再判断 dist > commit range
+#define CHARGING_LOST_SIGHT_GRACE                3.0    // 连续丢失目标视野超过该时间才退出 Charging
+
+enum struct ChargeMotion {
+    float m_flDist;                     // Charger 到目标的水平距离
+    float m_vecForward[3];              // Charger -> target 的方向向量
+    float m_vecSide[3];                 // 根据 vecForward 计算的水平侧向向量, 用于计算目标横向移动向量
+    float m_vecTargetVel2D[3];          // 目标的水平速度, z 轴分量清零
+    float m_flTargetSpeed;              // 目标水平速度大小
+    float m_flForwardSpeed;             // 目标速度在冲锋方向上的投影分量, >0 表示目标正在远离 Charger, <0 表示正在靠近 Charger
+    float m_flSideSpeed;                // 目标速度在横向方向上的投影分量, 有符号, 表示左右
+    float m_flAbsSideSpeed;             // 横向速度绝对值, 只关心目标横向位移大小
+    float m_flEffectiveChargeSpeed;     // 有效冲锋速度
+    float m_flClosingSpeed;             // Charger 与目标沿冲锋方向的相对接近速度
+    float m_flTimeToImpact;             // 按当前距离和接近速度估计的命中时间
+
+    void init() {
+        this.m_flDist = 0.0;
+        ZeroVector(this.m_vecForward);
+        ZeroVector(this.m_vecSide);
+        ZeroVector(this.m_vecTargetVel2D);
+        this.m_flTargetSpeed = 0.0;
+        this.m_flForwardSpeed = 0.0;
+        this.m_flSideSpeed = 0.0;
+        this.m_flAbsSideSpeed = 0.0;
+        this.m_flEffectiveChargeSpeed = 0.0;
+        this.m_flClosingSpeed = 0.0;
+        this.m_flTimeToImpact = 0.0;
+    }
+}
+
 // =========================================================================
 // State Charging 冲锋状态, Charger 以 500 速度冲锋目标无法躲避的距离大概在 36.0 左右
 // 但是连跳到这个距离之内再冲撞是十分困难的, 大多时候都是在空中达到这个距离, 由于目标
@@ -36,9 +74,11 @@ stock void RegisterState_Charging() {
 // OnEnter 函数
 // ============================================================
 stock void StateCharging_OnEnter(int client) {
+    g_AiChargers[client].m_flLastVisibleTime = GetGameTime();
     stateLog.debugAll("\n========== Charger (%N) State Charging On Enter ===========", client);
     // 确保每次进入冲锋决策逻辑时, 都有机会执行一次最后的连跳
     g_AiChargers[client].m_bBhopBeforeCharge = false;
+    g_AiChargers[client].m_flFinalBhopStartTime = 0.0;
 }
 
 // ============================================================
@@ -77,6 +117,11 @@ stock Action StateCharging_OnUpdate(int client, int& buttons, float vel[3], floa
     // 是否可视目标
     static bool visible;
     visible = L4D2_IsVisibleToPlayer(client, TEAM_INFECTED, TEAM_SURVIVOR, 0, targetEyePos);
+    if (visible) {
+        g_AiChargers[client].m_flLastVisibleTime = GetGameTime();
+    }
+    static bool recentlyVisible;
+    recentlyVisible = visible || GetGameTime() - g_AiChargers[client].m_flLastVisibleTime < CHARGING_LOST_SIGHT_GRACE;
     // 目标威胁类型
     static TargetThreatType threatType;
     threatType = getTargetThreatType(client, target);
@@ -91,6 +136,33 @@ stock Action StateCharging_OnUpdate(int client, int& buttons, float vel[3], floa
     if (isCharging || isPinning)
         return Plugin_Continue;
 
+    /*
+    * Charging 空中阶段只负责空中速度修正, 不做状态退出和真正冲锋
+    * 有些情况下 Charger 飞到目标背后会导致 visible=false, 但二者之间其实没有障碍
+    * 如果此时先执行 shouldExitChargingState(), Charger 会过早切回 Approach
+    * 然后重新走 Path/Direct 连跳, 可能朝错误的 goal 加速
+    */
+    if (!isOnGround) {
+        /*
+        * 是否允许进行空中速度方向修正
+        * 有时候 Charger 飞到目标背后会导致 visible=false, 但二者之间其实没有障碍, 因此 visible 不是硬条件
+        * 只要冲锋路径没有被阻挡就可以进行速度方向修正
+        */
+        static bool canPreserveAirLine;
+        canPreserveAirLine = (
+            visible ||
+            !isChargePathBlocked(client, target)
+        );
+
+        if (canPreserveAirLine &&
+            preserveAirChargeLine(client, target, true, AIR_CHARGE_LINE_CORR_CHARGE_LERP)
+        ) {
+            return Plugin_Changed;
+        }
+
+        return Plugin_Continue;
+    }
+
     // ============================================================
     // 检查是否需要切换到其他状态
     // ============================================================
@@ -98,12 +170,6 @@ stock Action StateCharging_OnUpdate(int client, int& buttons, float vel[3], floa
         g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
         return Plugin_Continue;
     }
-
-    // ============================================================
-    // 如果当前位置距离生还者 z 轴高度大于 CHARGE_THRESHOLD, 不允许冲锋
-    // ============================================================
-    if (FloatAbs(pos[2] - targetPos[2]) > CHARGE_Z_THRESHOLD)
-        return Plugin_Continue;
 
     // 处理冲锋结束或控人结束时的能力未就绪的情况, 切换到其他状态
     if (!isChargeAbilityReady(client)) {
@@ -120,44 +186,108 @@ stock Action StateCharging_OnUpdate(int client, int& buttons, float vel[3], floa
     chargeSpeed = !cvChargeSpeed ? DEFAULT_CHARGE_SPEED : cvChargeSpeed.FloatValue;
     GetEntPropVector(target, Prop_Data, "m_vecAbsVelocity", targetAbsVel);
 
-    // 计算 CHARGING 状态下连跳停止的距离阈值 (目标无法躲避冲锋的距离) Mins[0] * chargeSpeed / targetSpeed
-    // (dist / chargeSpeed) * targetSpeed <= Mins[0]
-    static float lastBhopDist, targetSpeed;
-    targetSpeed = getVectorLength2D(targetAbsVel);
-    lastBhopDist = (16.0 * chargeSpeed) / (targetSpeed > 0.0 ? targetSpeed : DEFAULT_SURVIVOR_SPEED);
-    lastBhopDist += CHARGE_DIST_TOLERANCE;
-
-    // 预测冲锋方向
-    static float predictPos[3];
-    calculatePredictedPosition(pos, targetPos, targetAbsVel, dist, chargeSpeed, predictPos);
-
-    // For debug print target predict position
-    /* float eyePos[3];
-    GetClientEyePosition(client, eyePos);
-    ShowDir(COLOR_GREEN, eyePos, predictPos); */
-
-    if (isOnGround) {
-        // 在地上时, 判断是否需要再次进行连跳接近生还者, 以到达生还者无法躲避的距离
-        if (shouldBhopBeforeCharge(client, target, dist, visible, lastBhopDist))
-            return performBhopBeforeCharge(client, pos, targetPos, targetAbsVel, dist, speed, visible, buttons);
-    } else {
-        // 在空中, 持续修正速度方向指向目标, 不急停
-        adjustAirVelocity(client, pos, targetPos, dist, lastBhopDist, speed, vVel);
+    /*
+    * 计算 Charging 状态下真正允许冲锋的距离阈值
+    * 如果阈值无法计算返回 false, 推迟冲锋, 暂时不切回 Approach 状态, 避免状态抖动
+    */
+    static float commitDist;
+    if (!getChargeCommitDist(pos, targetPos, targetAbsVel, chargeSpeed, commitDist)) {
+        stateLog.debugAll("Charger (%N) failed to calculate reliable charge commit distance for target (%N), wait in CHARGING STATE", client, target);
+        buttons &= ~IN_ATTACK;
+        buttons &= ~IN_ATTACK2;
+        setChargerAbilityCooldown(client, 1.0);
         return Plugin_Continue;
     }
 
-    if (!isCharging && !isPinning && isOnGround) {
-        stateLog.debugAll("Charger (%N) initiated charge towards target (%N), dist %.2f", client, target, dist);
-        // 设置立即冲锋
-        setChargerAbilityCooldown(client, -1.0);
+    /*
+    * 最后一跳已经发出后, 不要因为和 commit range 只差几个单位距离的预测误差立刻退回 Approach, 放弃这次冲锋
+    * 这段逻辑只处理最后一跳后的短暂待决窗口:
+    * 1. 已经接近 commit range, 直接冲锋
+    * 2. 仍在最后一跳预计落地窗口内, 继续保持 Charging, 等待下一帧/落地后的距离更新
+    * 3. 超过窗口仍然没有进入 commit range, 才退回 Approach 重新接近
+    */
+    static bool forceChargeNow;
+    forceChargeNow = false;
+
+    if (g_AiChargers[client].m_bBhopBeforeCharge) {
+        static float now, finalHopWaitTime;
+        now = GetGameTime();
+        finalHopWaitTime = getJumpAirTime() + CHARGE_FINAL_HOP_GRACE_TIME;
+
+        if (dist <= commitDist + CHARGE_COMMIT_GRACE_DIST) {
+            // 最后一跳已经落在 commitDist + grace range 之内了, 可以直接冲锋
+            g_AiChargers[client].m_bBhopBeforeCharge = false;
+            g_AiChargers[client].m_flFinalBhopStartTime = 0.0;
+            forceChargeNow = true;
+        } else if (now - g_AiChargers[client].m_flFinalBhopStartTime <= finalHopWaitTime) {
+            /*
+            * 最后一跳刚发出的下一帧, 还没到落地结算查看 dist > commit dist 的时候, 应该继续保持 Charging 状态, 等待落地后查看是否进入 commit range
+            * 在空中时禁止打拳和冲锋
+            */
+            buttons &= ~IN_ATTACK;
+            buttons &= ~IN_ATTACK2;
+
+            stateLog.debugAll("Charger (%N) waiting final bhop commit window, dist %.2f, commitDist %.2f, grace %.2f",
+                client, dist, commitDist, CHARGE_COMMIT_GRACE_DIST);
+
+            return Plugin_Changed;
+        } else {
+            // 最后一跳的 grace time 窗口已经结束, 但是仍然没有进入 (commit range + grace range), 说明最后一跳真的失败, 只能返回 Approach 重新接近目标
+            stateLog.debugAll("Charger (%N) final bhop commit window expired, dist %.2f > commitDist %.2f, transition to APPROACH STATE",
+                client, dist, commitDist
+            );
+
+            g_AiChargers[client].m_bBhopBeforeCharge = false;
+            g_AiChargers[client].m_flFinalBhopStartTime = 0.0;
+            g_AiChargers[client].m_iBetterTarget = 0;
+            g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
+            return Plugin_Continue;
+        }
+    }
+
+    /*
+    * 如果 Charger 已经进入 commit range, 那么可以直接冲锋 (dist < commit range + grace range) 时 forceChargeNow 为 true
+    * 未进入 commit range 时, 只有当最后一跳可以进入 commit range 时才执行最后一跳
+    * 如果最后一跳都无法进入 commit range, 说明当前不适合冲锋, 退回 Approach 重新接近目标
+    */
+    if (!forceChargeNow && dist > commitDist) {
+        static Action finalBhopRes;
+        // performFinalBhopBeforeCharge 成功返回 Plugin_Changed 然后立即结束这一帧的处理, 失败返回 Plugin_Continue
+        finalBhopRes = performFinalBhopBeforeCharge(client, pos, targetPos, targetAbsVel, dist, commitDist, speed, recentlyVisible, buttons);
+        if (finalBhopRes != Plugin_Continue)
+            return finalBhopRes;
+
+        stateLog.debugAll("Charger (%N) cannot enter charge commit range in one final bhop, dist %.2f > commitDist %.2f, transition to APPROACH STATE",
+            client, dist, commitDist);
+        
+        g_AiChargers[client].m_iBetterTarget = 0;
+        g_AiChargers[client].m_bBhopBeforeCharge = false;
+        g_AiChargers[client].m_flFinalBhopStartTime = 0.0;
+        g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
+        return Plugin_Continue;
+    }
+
+    if (!isCharging && !isPinning) {
+        static float aimPos[3];
+        if (!calculateChargeAimPosition(pos, targetPos, targetAbsVel, chargeSpeed, aimPos))
+            aimPos = targetPos;
+
         // 设置视角方向
         static float dir[3];
-        MakeVectorFromPoints(pos, predictPos, dir);
+        MakeVectorFromPoints(pos, aimPos, dir);
+        dir[2] = 0.0;
+
+        // 设置立即冲锋
+        setChargerAbilityCooldown(client, -1.0);
         GetVectorAngles(dir, dir);
         TeleportEntity(client, NULL_VECTOR, dir, NULL_VECTOR);
+
         // 发起冲锋
-        buttons &= ~IN_ATTACK2;
+        buttons |= IN_ATTACK2;
         buttons |= IN_ATTACK;
+
+        stateLog.debugAll("Charger (%N) initiated charge towards target (%N), dist %.2f, commitDist %.2f", client, target, dist, commitDist);
+
         return Plugin_Changed;
     }
     return Plugin_Continue;
@@ -166,14 +296,15 @@ stock Action StateCharging_OnUpdate(int client, int& buttons, float vel[3], floa
 bool shouldExitChargingState(int client, int target, float dist, bool visible, TargetThreatType threatType) {
     if (!isAiCharger(client) || !IsValidSurvivor(target) || !IsPlayerAlive(target))
         return true;
+    if (IsClientIncapped(target) || IsClientHanging(target))
+        return true;
 
     /*
-        增加自身位置到目标位置的 GAP 检测, 避免在大平地上 Charger 进入冲锋状态后, 目标继续向后走位, 导致 Charger 与目标的距离频繁在 minDist 之间变化, Charger 的状态频繁在 APPROACH 和 CHARGING 之间切换，无法专心连跳到距离目标无法躲避冲锋的位置, 因此 CHARGING 状态要切换到其他状态必须满足距离条件和 GAP 条件 (自身到目标的连线之间有超过 MaxJumpHeight 的落差)
+    * Hunter 和其他 Charger 已经占有不可抢占的控制权, 此时不能抢夺目标
+    * isSurvivorPinned 不包含 Smoker/Jockey, 所以这两种控制仍允许 Charger 抢夺
     */
-    static Address pLocomotion;
-    pLocomotion = clientGetLocomotionInterface(client);
-    if (!pLocomotion) {
-        stateLog.debugAll("Charger (%N) failed to get locomotion interface, transition to APPROACH STATE", client);
+    if (isSurvivorPinned(target)) {
+        stateLog.debugAll("Charger (%N), target (%N) is controlled by Hunter/Charger, transition to APPROACH STATE", client, target);
         return true;
     }
 
@@ -181,21 +312,46 @@ bool shouldExitChargingState(int client, int target, float dist, bool visible, T
     GetClientAbsOrigin(client, pos);
     GetClientAbsOrigin(target, targetPos);
 
-    static bool hasGap;
-    hasGap = hasPotentialGap(pLocomotion, pos, targetPos);
+    // 冲锋路径上面存在障碍物和高度差过大的 Gap 属于独立的硬退出理由, 不受距离、视野或最后一跳宽限窗口影响
+    if (isChargePathBlocked(client, target)) {
+        stateLog.debugAll("Charger (%N), charge path to target (%N) is blocked, transition to APPROACH STATE", client, target);
+        return true;
+    }
+
+    /*
+    * 沿实际地面逐段采样。连续上坡/下坡即使累计高度差超过 JUMP_HEIGHT 也不会退出
+    * 只有相邻地面不连续、两个采样点之间高度差大于 JUMP_HEIGHT 说明存在 Gap 才退出
+    */
+    if (hasPotentialGap2(client, pos, targetPos, JUMP_HEIGHT)) {
+        stateLog.debugAll("Charger (%N), route to target (%N) has a gap, transition to APPROACH STATE", client, target);
+        return true;
+    }
+
+    /*
+    * 最后一跳待决期间只忽略软退出条件, 上面的目标状态、阻挡和 Gap 仍然立即生效
+    */
+    static bool finalHopPending;
+    finalHopPending = (
+        g_AiChargers[client].m_bBhopBeforeCharge &&
+        g_AiChargers[client].m_flFinalBhopStartTime > 0.0 &&
+        GetGameTime() - g_AiChargers[client].m_flFinalBhopStartTime <= getJumpAirTime() + CHARGE_FINAL_HOP_GRACE_TIME
+    );
+
+    if (finalHopPending)
+        return false;
 
     static float minDist;
     minDist = g_cvBhopMinDist.FloatValue + STATE_TOLERANCE_DIST;
-    // 失去目标视野, 转换为 APPROACH STATE
-    if (!visible) {
-        stateLog.debugAll("Charger (%N) lost the sight of target (%N), transition to APPROACH STATE", client, target);
+
+    // 连续丢失目标视野超过宽限期才转换为 APPROACH STATE
+    if (!visible && GetGameTime() - g_AiChargers[client].m_flLastVisibleTime >= CHARGING_LOST_SIGHT_GRACE) {
+        stateLog.debugAll("Charger (%N) lost sight of target (%N) for %.1f seconds, transition to APPROACH STATE", client, target, CHARGING_LOST_SIGHT_GRACE);
         return true;
     }
     // 目标非手持近战, 且到目标距离大于 g_cvBhopMinDist.FloatValue + 容差距离, 转换为 APPROACH STATE
     if (
         threatType != Threat_Melee &&
-        dist > minDist &&
-        hasGap
+        dist > minDist
     ) {
         stateLog.debugAll("Charger (%N), target (%N), distance %.2f > min dist %.2f, transition to APPROACH STATE", client, target, dist, minDist);
         return true;
@@ -206,8 +362,7 @@ bool shouldExitChargingState(int client, int target, float dist, bool visible, T
     minDist = meleeRange + g_cvMeleeBaitZoneMaxRange.FloatValue + STATE_TOLERANCE_DIST;
     if (
         threatType == Threat_Melee &&
-        dist > minDist &&
-        hasGap
+        dist > minDist
     ) {
         stateLog.debugAll("Charger (%N), target (%N) holding melee, dist %.2f > baitZoneMax %.2f, transition to APPROACH STATE", client, target, dist, minDist);
         return true;
@@ -248,161 +403,265 @@ void handleAbilityNotReady(int client, int target, float dist, TargetThreatType 
 }
 
 /**
-* 计算目标的预测位置 (混合当前位置和预测位置)
+* 构造目标运动学模型
+* @param pos Charger 位置
 * @param targetPos 目标位置
-* @param targetVel 目标的速度
-* @param dist 到目标距离
+* @param targetVel 目标速度
 * @param chargeSpeed 冲锋速度
-* @param predictPos 预测位置
-* @return void
+* @param motion 返回的冲锋运动学模型
+* @return 运动学模型构建成功返回 true
+    1. 当前 Charger 和 target 距离过近, 小于 CHARGE_DIR_EPSILON, 表示冲锋方向退化, 直接判断高度差满足允许冲锋
+    2. 目标水平速度已经超过了当前最大冲锋速度, 并且目标正在横向移动或者逃逸, 说明这次冲锋大概率无法命中, 返回 false, 模型构建失败
+    3. Charger 冲锋时接近目标的相对速度太小, 小于 120.0, 大概率无法命中, 返回 false, 模型构建失败
+* @error 
 **/
-static void calculatePredictedPosition(const float pos[3], const float targetPos[3], const float targetVel[3], float dist, float chargeSpeed, float predictPos[3]) {
-    static float predictTime;
-    predictTime = (dist / chargeSpeed) + 0.25;
-    if (predictTime > PREDICT_MAX_TIME) predictTime = PREDICT_MAX_TIME;
+stock bool buildChargeMotion(const float pos[3], const float targetPos[3], const float targetVel[3], float chargeSpeed, ChargeMotion motion) {
+    motion.init();
 
-    // 计算平行于冲锋方向的向量
-    static float fwdDir[3];
-    MakeVectorFromPoints(pos, targetPos, fwdDir);
-    fwdDir[2] = 0.0;
-    NormalizeVector(fwdDir, fwdDir);
+    /*
+    * 计算 Charger -> target 冲锋的水平方向
+    * 如果方向向量长度小于 CHARGE_DIR_EPSILON, 不代表不能冲锋, 而是代表 Charger 和 target 过于近了, 说明 forward 方向退化
+    * 但是如果满足高度差范围的话, 还是能够直接冲锋的
+    */
+    MakeVectorFromPoints(pos, targetPos, motion.m_vecForward);
+    motion.m_vecForward[2] = 0.0;
 
-    // 计算垂直于冲锋方向的横向位移向量
-    static float sideDir[3];
-    GetVectorCrossProduct(fwdDir, {0.0, 0.0, 1.0}, sideDir);
-    NormalizeVector(sideDir, sideDir);
-
-    // 将生还者速度进行正交分解
-    static float velFwd, velSide;
-    velFwd = GetVectorDotProduct(fwdDir, targetVel);
-    velSide = GetVectorDotProduct(sideDir, targetVel);
-
-    // 分别计算两个轴向的预测偏移量
-    static float offsetFwd, offsetSide;
-    offsetFwd = velFwd * predictTime;
-    offsetSide = velSide * predictTime;
-
-    // 如果预测时间是 MAX_PREDICT_TIME, 生还者横向速度很大, offsetSide 会很大
-    // 如果生还者此时反向走位, Charger 会偏离很远, 因此将横向预测位移限制在 MAX_PREDICT_LATERAL_OFFSET 内
-    if (offsetSide > PREDICT_MAX_LATERAL_OFFSET) offsetSide = PREDICT_MAX_LATERAL_OFFSET;
-    else if (offsetSide < -PREDICT_MAX_LATERAL_OFFSET) offsetSide = -PREDICT_MAX_LATERAL_OFFSET;
-
-    // 合成最终预测坐标
-    predictPos[0] = targetPos[0] + (fwdDir[0] * offsetFwd) + (sideDir[0] * offsetSide);
-    predictPos[1] = targetPos[1] + (fwdDir[1] * offsetFwd) + (sideDir[1] * offsetSide);
-    predictPos[2] = targetPos[2];
-}
-
-/**
-* 判断在冲锋之前是否需要最后进行一次连跳
-* @param client 客户端索引
-* @param dist 到目标距离
-* @param chargeSpeed 冲锋速度
-* @param targetSpeed 目标速度
-* @param visible 是否可见目标
-* @return bool
-**/
-stock bool shouldBhopBeforeCharge(int client, int target, float dist, bool visible, float lastBhopDist) {
-    // 0. 未满足基本连跳条件, 不允许连跳
-    if (!allowToBhop(client))
+    motion.m_flDist = NormalizeVector(motion.m_vecForward, motion.m_vecForward);
+    if (motion.m_flDist <= CHARGE_DIR_EPSILON)
         return false;
-    // 1. 无目标视野, 不允许连跳
-    if (!visible)
+
+    // 计算沿着冲锋方向的侧向方向向量
+    GetVectorCrossProduct(motion.m_vecForward, {0.0, 0.0, 1.0}, motion.m_vecSide);
+    NormalizeVector(motion.m_vecSide, motion.m_vecSide);
+
+    // 提取目标的水平速度
+    motion.m_vecTargetVel2D[0] = targetVel[0];
+    motion.m_vecTargetVel2D[1] = targetVel[1];
+    motion.m_vecTargetVel2D[2] = 0.0;
+
+    motion.m_flTargetSpeed = getVectorLength2D(motion.m_vecTargetVel2D);
+
+    // 目标水平速度已经超过当前最大冲锋速度时, 认为这次冲锋大概率无法命中, 不允许冲锋
+    if (motion.m_flTargetSpeed > chargeSpeed)
         return false;
-    // 2. 如果已经在目标无法躲避的范围内, 不允许连跳
-    if (dist <= lastBhopDist) {
-        stateLog.debugAll("Charger (%N) dist %.2f <= lastBhopDist + tolerance %.2f, performing bhop before charge to (%N)", client, dist, lastBhopDist, target);
+
+    /*
+    * 分解目标当前速度
+    * m_flForwardSpeed 表示目标沿着冲锋方向的速度分量, >0 说明目标远离 Charger, <0 说明目标靠近 Charger
+    * m_flSideSpeed 表示目标沿着冲锋方向的侧向速度分量, >0 说明目标向右移动, <0 说明目标向左移动
+    * m_flAbsSideSpeed 表示目标横向速度绝对值大小, 用于 getCommitDist, 因为 getCommitDist 只需要计算目标多久能够离开命中宽度
+    */
+    motion.m_flForwardSpeed = GetVectorDotProduct(motion.m_vecTargetVel2D, motion.m_vecForward);
+    motion.m_flSideSpeed = GetVectorDotProduct(motion.m_vecTargetVel2D, motion.m_vecSide);
+    motion.m_flAbsSideSpeed = FloatAbs(motion.m_flSideSpeed);
+
+    /*
+    * 计算有效冲锋速度和接近速度
+    * 考虑到 Charger 冲锋的启动时间, 不是直接从 runTopSpeed 直接到 max charge speed 的, 但是不知道启动时间是多少
+    * 因此保守估计 max charge speed, 宁愿慢一些, 也不要过早冲锋
+    */
+    motion.m_flEffectiveChargeSpeed = chargeSpeed * CHARGE_SPEED_EFFECTIVE_FACTOR;
+    motion.m_flClosingSpeed = motion.m_flEffectiveChargeSpeed - motion.m_flForwardSpeed;
+
+    if (motion.m_flClosingSpeed < 120.0)
         return false;
-    }
+
+    // 估计冲锋命中时间
+    motion.m_flTimeToImpact = motion.m_flDist / motion.m_flClosingSpeed;
     return true;
 }
 
 /**
-* 冲锋前进行最后一次到目标方向的连跳
-* @param client 客户端索引
-* @param pos Charger 当前位置
-* @param targetPos 目标当前位置
-* @param dist 到目标的距离
-* @param targetVel 目标当前速度向量
-* @param visible 是否可见目标
-* @return Action
+* 动态计算 Charger 冲锋目标无法躲避冲锋的距离, 尤其是考虑了目标横向位移, 如果目标横向位移大, 那么允许冲锋距离 commit dist 就要小一点, 否则可以大一点
+* @param pos Charger 位置
+* @param targetPos 目标位置
+* @param targetVel 目标速度
+* @param chargeSpeed 冲锋速度
+* @param commitDist 返回冲锋允许的最小距离
+* @return bool, 返回 true 表示最小冲锋允许距离预测成功
+* @error 
 **/
-stock Action performBhopBeforeCharge(
-    int client, const float pos[3], const float targetPos[3], const float targetVel[3],
-    float dist, float speed, bool visible, int& buttons
-) {
-    // 计算目标下一帧的位置作为连跳落点
-    static float predictPos[3];
-    AddVectors(targetPos, targetVel, predictPos);
+stock bool getChargeCommitDist(const float pos[3], const float targetPos[3], const float targetVel[3], float chargeSpeed, float& commitDist) {
+    commitDist = CHARGE_COMMIT_MIN_DIST;
 
-    // 计算到目标的方向向量
-    static float dir[3], baseSpeed;
-    MakeVectorFromPoints(pos, predictPos, dir);
-    dir[2] = 0.0;
-    NormalizeVector(dir, dir);
-    baseSpeed = SDKCall(g_hSdkGetRunTopSpeed, client);
-    ScaleVector(dir, (baseSpeed > speed ? baseSpeed : speed) + g_cvBhopImpulse.FloatValue);
+    static ChargeMotion motion;
+    if (!buildChargeMotion(pos, targetPos, targetVel, chargeSpeed, motion)) {
+        /*
+        * XY 基本重合时方向退化, 但高度可达就可以用最小 charge commit 距离来进行冲锋, 只要 charger 到达最小 charge commit 距离, 那么允许冲锋
+        * 如果不是方向退化, buildChargeMotion 失败代表目标速度或接近速度不可靠, 不允许冲锋, 维持 Charging 状态等待一个合适的冲锋时机
+        */
+        if (motion.m_flDist <= CHARGE_DIR_EPSILON)
+            return isChargeHeightReachable(pos, targetPos);
 
-    // 连跳最大速度限制, 缩放水平方向上的速度向量, 垂直方向保持不变
-    static float vecLen;
-    vecLen = getVectorLength2D(dir);
-    if (vecLen > g_cvBhopMaxSpeed.FloatValue) {
-        static float scale;
-        scale = g_cvBhopMaxSpeed.FloatValue / vecLen;
-        ScaleVector(dir, scale);
+        return false;
     }
 
-    // 下一跳落点不安全, 放弃连跳
-    if (!nextTickPosCheck(client, dir, visible))
-        return Plugin_Continue;
+    static float sideSpeed;
+    sideSpeed = motion.m_flAbsSideSpeed;
 
-    buttons |= IN_DUCK;
-    buttons |= IN_JUMP;
-    TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, dir);
-    g_AiChargers[client].m_bBhopBeforeCharge = true;
-    stateLog.debugAll("Charger (%N) performed bunnyhop before charge, dist %.2f, speed %.2f", client, dist, getVectorLength2D(dir));
-    return Plugin_Changed;
+    /*
+    * 即使目标当前纯直线后退, 也给横向逃逸一个最小估计值
+    * 这是为了防止 commitDist 被除法放大到过远, 让 Charger 太早冲锋
+    */
+    if (sideSpeed < CHARGE_SIDE_SPEED_MIN)
+        sideSpeed = CHARGE_SIDE_SPEED_MIN;
+
+    /*
+    * timeToHit = dist / closingSpeed
+    * sideEscape = sideSpeed * timeToHit
+    * 命中条件: sideEscape <= hitWidth
+    * 推导: sideSpeed * (dist / closingSpeed) <= hitWidth
+    * 所以: dist <= (hitWidth * closingSpeed) / sideSpeed
+    */
+    commitDist = (CHARGE_HIT_WIDTH * motion.m_flClosingSpeed) / sideSpeed;
+    commitDist += CHARGE_DIST_TOLERANCE;
+
+    if (commitDist < CHARGE_COMMIT_MIN_DIST) {
+        commitDist = CHARGE_COMMIT_MIN_DIST;
+    } else if (commitDist > CHARGE_COMMIT_MAX_DIST) {
+        commitDist = CHARGE_COMMIT_MAX_DIST;
+    }
+
+    return true;
 }
 
 /**
-* 在空中时持续调整速度方向指向目标, 确保落地时尽可能靠近目标
-* 不再进行空中急停: 急停会导致生还者在 charger 落地前跑出 100+ units, 落地后冲锋距离过远
-* @param client 客户端索引
-* @param pos Charger 当前位置
-* @param targetPos 目标当前位置
-* @param vVel Charger 当前的速度向量
-* @param speed Charger 当前速度
-* @return void
+* 计算 Charger 冲锋前瞄准的位置, 通过 build charge motion 中分解的目标速度, 预测目标在 timeToImpact 时间后的位置
+* @param pos Charger 位置
+* @param targetPos 目标位置
+* @param targetVel 目标速度
+* @param chargeSpeed 冲锋速度
+* @param aimPos 瞄准位置
+* @return bool, 返回 true 表示位置预测成功
+* @error 
 **/
-void adjustAirVelocity(int client, const float pos[3], const float targetPos[3], float dist, float lastBhopDist, float speed, const float vVel[3]) {
-    // 当前 Charger 位置距离目标的垂直夹角大于 45 度, 不进行速度方向修正
-    static float dx, dz, pitch;
-    dx = SquareRoot(Pow(targetPos[0] - pos[0], 2.0) + Pow(targetPos[1] - pos[1], 2.0));
-    dz = targetPos[2] - pos[2];
-    pitch = RadToDeg(ArcTangent2(dz, dx));
-    if (pitch > 45.0)
-        return;
+stock bool calculateChargeAimPosition(const float pos[3], const float targetPos[3], const float targetVel[3], float chargeSpeed, float aimPos[3]) {
+    // 运动学模型构建失败, 不进行冲锋位置预测
+    static ChargeMotion motion;
+    if (!buildChargeMotion(pos, targetPos, targetVel, chargeSpeed, motion))
+        return false;
 
-    // Charger 比目标高太多 (目标走到低处地形), 不进行水平速度修正
-    // 避免 charger 追着目标落到其头顶, 而是让 charger 自然落到当前位置的地面再接近
-    if (pos[2] - targetPos[2] > CHARGE_Z_THRESHOLD)
-        return;
+    // 如果冲锋时间太长, 那么就限制到最大预测 PREDICT_MAX_TIME
+    static float predictTime;
+    predictTime = motion.m_flTimeToImpact;
+    if (predictTime > PREDICT_MAX_TIME)
+        predictTime = PREDICT_MAX_TIME;
 
-    // 距离已经小于目标无法躲避距离, 停止进行修正
-    if (dist <= lastBhopDist)
-        return;
+    static float offsetFwd, offsetSide;
+    offsetFwd = motion.m_flForwardSpeed * predictTime;
+    offsetSide = motion.m_flSideSpeed * predictTime;
 
-    static float dir[3];
-    MakeVectorFromPoints(pos, targetPos, dir);
+    // 限制侧向偏移, 侧向偏移太多会导致 Charger 撞空
+    if (offsetSide > PREDICT_MAX_LATERAL_OFFSET) {
+        offsetSide = PREDICT_MAX_LATERAL_OFFSET;
+    } else if (offsetSide < -PREDICT_MAX_LATERAL_OFFSET) {
+        offsetSide = -PREDICT_MAX_LATERAL_OFFSET;
+    }
+
+    aimPos[0] = targetPos[0] + (motion.m_vecForward[0] * offsetFwd) + (motion.m_vecSide[0] * offsetSide);
+    aimPos[1] = targetPos[1] + (motion.m_vecForward[1] * offsetFwd) + (motion.m_vecSide[1] * offsetSide);
+    aimPos[2] = targetPos[2];
+
+    return true;
+}
+
+stock Action performFinalBhopBeforeCharge(int client, const float pos[3], const float targetPos[3], const float targetVel[3],
+    float dist, float commitDist, float speed, bool visible, int& buttons
+) {
+    if (!visible || !allowToBhop(client))
+        return Plugin_Continue;
+
+    // 距离已经到 commit dist 之内了, 直接冲锋
+    if (dist <= commitDist)
+        return Plugin_Continue;
+
+    static float airTime;
+    airTime = getJumpAirTime();
+    if (airTime <= 0.0)
+        return Plugin_Continue;
+
+    static float targetVel2D[3];
+    targetVel2D = targetVel;
+    targetVel2D[2] = 0.0;
+    
+    static float predictPos[3];
+    predictPos[0] = targetPos[0] + (targetVel2D[0] * airTime);
+    predictPos[1] = targetPos[1] + (targetVel2D[1] * airTime);
+    predictPos[2] = targetPos[2];
+
+    static float dir[3], predictDist;
+    MakeVectorFromPoints(pos, predictPos, dir);
     dir[2] = 0.0;
-    NormalizeVector(dir, dir);
-    // 缩放空中速度向量, 使其不小于 runTopSpeed + bhopImpulse, 理论上, 这个速度越快 charger 贴脸的时间越短, 越容易撞中
-    static float baseSpeed;
+
+    predictDist = NormalizeVector(dir, dir);
+    if (predictDist <= commitDist) {
+        return Plugin_Continue;
+    }
+
+    static float desiredRemainDist;
+    desiredRemainDist = commitDist * 0.60;
+
+    // Charger 实际需要从当前位置一次连跳到 commitDist * 0.60 的距离
+    static float travelDist;
+    travelDist = predictDist - desiredRemainDist;
+
+    if (travelDist <= 0.0)
+        return Plugin_Continue;
+
+    static float requiredSpeed;
+    requiredSpeed = travelDist / airTime;
+    if (requiredSpeed <= 0.0)
+        return Plugin_Continue;
+
+    // 计算最后一跳的连跳速度, 最小不能小于 runTopSpeed, 最大不能大于 g_cvBhopMaxSpeed.FloatValue
+    static float baseSpeed, maxHopSpeed;
     baseSpeed = SDKCall(g_hSdkGetRunTopSpeed, client);
-    ScaleVector(dir, (baseSpeed > speed ? baseSpeed : speed) + g_cvBhopImpulse.FloatValue);
-    dir[2] = vVel[2];
+    maxHopSpeed = speed;
+
+    if (maxHopSpeed < baseSpeed)
+        maxHopSpeed = baseSpeed;
+
+    maxHopSpeed += g_cvBhopImpulse.FloatValue;
+
+    if (maxHopSpeed > g_cvBhopMaxSpeed.FloatValue)
+        maxHopSpeed = g_cvBhopMaxSpeed.FloatValue;
+
+    if (requiredSpeed > maxHopSpeed)
+        return Plugin_Continue;
+
+    // 缩放最后一跳的速度向量
+    ScaleVector(dir, requiredSpeed);
+
+    static float landPos[3];
+    landPos[0] = pos[0] + (dir[0] * airTime);
+    landPos[1] = pos[1] + (dir[1] * airTime);
+    landPos[2] = pos[2];
+
+    if (hasPotentialGap2(client, pos, landPos, JUMP_HEIGHT))
+        return Plugin_Continue;
+
+    if (!nextTickPosCheck(client, dir, visible))
+        return Plugin_Continue;
+
+    // 如果最后一跳的落点安全, 执行连跳
+    buttons |= IN_DUCK;
+    buttons |= IN_JUMP;
+
     TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, dir);
-    // stateLog.debugAll("Charger (%N) adjusted air velocity, dist %.2f, speed %.2f", client, dist, getVectorLength2D(dir));
+    g_AiChargers[client].m_bBhopBeforeCharge = true;
+    g_AiChargers[client].m_flFinalBhopStartTime = GetGameTime();
+    g_AiChargers[client].m_flLastHopSpeed = getVectorLength2D(dir);
+
+    stateLog.debugAll(
+        "Charger (%N) performed final bunnyhop before charge, dist %.2f, commitDist %.2f, requiredSpeed %.2f, maxHopSpeed %.2f",
+        client,
+        dist,
+        commitDist,
+        getVectorLength2D(dir),
+        maxHopSpeed
+    );
+
+    return Plugin_Changed;
 }
 
 // ============================================================
@@ -412,4 +671,7 @@ stock void StateCharging_OnExit(int client) {
     stateLog.debugAll("\n========== Charger (%N) State Charging On Exit ===========", client);
     // 再次重置人为冲锋延迟标记
     g_AiChargers[client].m_bChargeDelayed = false;
+    g_AiChargers[client].m_bBhopBeforeCharge = false;
+    g_AiChargers[client].m_flFinalBhopStartTime = 0.0;
+    g_AiChargers[client].m_iBetterTarget = 0;
 }

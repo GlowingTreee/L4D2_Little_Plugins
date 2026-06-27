@@ -646,10 +646,20 @@ Charger 发动冲锋并处理冲锋结束后的逻辑。
 
    1. 主流连跳方式分析中基于导航路径 `PATH` 的连跳的劣势问题导致 Charger 无法有效追击目标，这个方法见仁见智吧，后续会上传普通版本 (使用之前的基于到目标方向作为连跳加速方向) 的 `state_approach.inc` 用于替换连跳方法 (主要替换 `executeGroundBhop` 地面开始连跳和 `executeAirCorrection` 空中速度方向修正函数)
    2. 以及冲锋前目标位置预测算法的不准确，导致部分场景 Charger 就算已经到达了 `lastBhopDist` 理论的冲锋目标无法躲避距离，也仍然不能准确命中目标
+   3. 若目标手持近战向 Charger 靠近, Charger 在空中进入 melee bait range 时无法后跳, 需要等待落地进行概率后跳, Charger 进入 melee bait range 后会急停, 等待落地概率后跳, 此时生还者继续向前大概率可以使用近战攻击到 Charger
 
 ## 更新日志
 
 <details>
 <summary>2026-03-03</summary>
 1. 上传插件<br>
+</details>
+
+<details>
+<summary>2026-06-27</summary>
+1. 修复连跳寻路问题, 03-03 版本中的 Charger 连跳进入 min strate dist 范围后且到目标直线距离没有 Gap (调用游戏原生 HasPotentialGap 判断), 或当前 PATH 无效 (PATH is null 或者 Charger 已走完当前 PATH), 直接朝着目标方向直线连跳, 但这忽略了地形 (比如 c4m2 糖厂楼梯口 PATH 断裂 Charger 直接朝着另一侧的目标直线连跳导致摔下楼梯)；当前版本改为进入 min strafe dist 或 PATH 无效时需要通过额外的 isDirectBhopSafe 检查, 若检查通过才允许直线连跳；若当前 PATH 仍然有效, 若 Charger 当前 NavArea 不在 PATH 上, 则尝试无效化当前 PATH, 交给 ChargerAttack::Update 中触发重新寻路, Charger 未走完当前 PATH 时继续沿着当前 PATH 连跳<br>
+2. 修复除了 state approach 之外的其他 state 没有空中速度修正, 导致 state approach 时若在空中达到 bait dist 切换至 state bait, 解除空中速度修正, 导致 charger 飞过头；现版本在 stage bait, state locked, state charging 中也加入了空中速度修正代码<br>
+3. 修复 state charging 状态下进行冲锋前最后一跳时在空中 Z 轴速度 vel[2] 并未保留原始速度向量的 vel[2] 导致可能会贴在目标脸上无法落地的问题；当前版本若最后一跳也无法进入 commit charge dist 那么回退到 state approach 尝试重新接近目标<br>
+4. 优化 state bait 与 state charging 的退出条件<br>
+5. 修复无技能追击问题, 之前使用基于 ILocomotion::Approach 与 ILocomotion::FaceTowards 的方法会导致 Charger 无法正常触发寻路, 若目标在楼梯上则 Charger 并不会上楼梯 (如 c4m2 糖厂楼梯, Charger 仅会在楼下尝试移动到目标坐标)；当前版本使用拦截 ChargerEvade 行为并在其中使用 BotCmdMove 创建 BehaviorMoveTo 行为让 Charger 寻路并移动到目标位置, 同时不立刻结束 ChargerEvade 行为节点 (若 BheaviorMoveTo 行为节点创建后立即结束 ChargerEvade 行为节点会导致 BehaviorMoveTo 行为节点一起销毁)；但是 Actions 拓展无法正常捕获 BehaviorMoveTo 行为的创建, 因此不能照搬 Ai-Smoker3 的做法, 只能退一步在 OnPlayerRunCmd 中检查目标坐标变化并无效化当前 BehaviorMoveTo 行为
 </details>
