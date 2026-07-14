@@ -298,25 +298,6 @@ stock bool isTargetVulnerable(int client, int target) {
         stockLog.debugAll("Charger (%N)'s target (%N) is being watched by another survivor, can charge", client, target);
         return true;
     }
-    
-    // 如果目标手持近战武器, 且 charger 生命值高于近战斩杀线, 可以直接冲撞
-    if (L4D2_GetMeleeWeaponIndex(weaponName) > -1) {
-        static int health;
-        static int meleeDamageCharger;
-        health = GetEntProp(client, Prop_Data, "m_iHealth");
-        meleeDamageCharger = !cvMeleeDamageCharger ? DEFAULT_MELEE_DMG_CHARGER : cvMeleeDamageCharger.IntValue;
-        if (health > meleeDamageCharger) {
-            stockLog.debugAll("Charger (%N)'s target (%N) is holding melee weapon %s, charger health %d is greater than melee damage charger %.2f, can charge",
-                client, target, weaponName, health, meleeDamageCharger);
-            return true;
-        }
-    }
-
-    // 如果当前 charger 的博弈时间超过了最大允许的博弈时间, 直接冲撞
-    if (g_ChargerStateContext[client].getStateDuration() > g_cvBaitMaxDuration.FloatValue) {
-        stockLog.debugAll("Charger (%N)'s bait time is up, can charge to its target (%N)", client, target);
-        return true;
-    }
 
     // 进阶检查, 检查朝着目标方向冲撞位置后若干距离是否有墙体或向下是否有足够高差或必杀
     static float eyeAng[3];

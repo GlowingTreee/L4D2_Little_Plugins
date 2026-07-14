@@ -44,6 +44,7 @@ public void OnPluginStart() {
 	// charger is allowed to bhop when its distance from the target is between [ai_charger3_bhop_min_dist, ai_charger3_bhop_max_dist], if the distance is less than this value, charger will transition to bait state
 	g_cvBhopMinDist = CreateConVar("ai_charger3_bhop_min_dist", "75.0", "禁止连跳的最小距离, 小于这个距离转换为博弈状态", CVAR_FLAGS, true, 0.0);
 	g_cvBhopMaxDist = CreateConVar("ai_charger3_bhop_max_dist", "9999.0", "允许连跳的最大距离", CVAR_FLAGS, true, 0.0);
+	// when the distance between charger and target is less than this value during approach state, charger will switch to direct bhopping (bhop directly toward the target)
 	g_cvDirectBhopDist = CreateConVar("ai_charger3_bhop_direct_dist", "400.0", "Charger 在接近状态中切换到朝目标方向直线连跳的距离阈值", CVAR_FLAGS, true, 0.0);
 	// the bhop impulse, when charger is allowed to bhop, each time it jumps up from the ground, it will gain a speed impulse with the value of ai_charger3_bhop_impulse
 	g_cvBhopImpulse = CreateConVar("ai_charger3_bhop_impulse", "100.0", "连跳的加速度", CVAR_FLAGS, true, 0.0);
@@ -69,7 +70,7 @@ public void OnPluginStart() {
 	// The minimum distance from target required for charger to perform double strafe bhop (bhopping is disabled when closer than this distance)
 	g_cvBhopStrafeTwiceDist = CreateConVar("ai_charger3_bhop_strafe_twice_dist", "400.0", "允许 Charger 侧向连跳两次的最小距离 (距离目标点大于这个距离才允许侧向连跳两次)", CVAR_FLAGS);
 	// when the target is holding a melee weapon, the minimum range of the melee bait zone (calculated as melee_range plus this value)
-	g_cvMeleeBaitZoneMinRange = CreateConVar("_ai_charger3_melee_bait_minrange", "15.0", "目标拿着近战时, 近战博弈区的最小范围, melee_range + 这个值", CVAR_FLAGS, true, 0.0);
+	g_cvMeleeBaitZoneMinRange = CreateConVar("_ai_charger3_melee_bait_minrange", "20.0", "目标拿着近战时, 近战博弈区的最小范围, melee_range + 这个值", CVAR_FLAGS, true, 0.0);
 	// when the target is holding a melee weapon, the maximum range of the melee bait zone (calculated as melee_range plus this value)
 	g_cvMeleeBaitZoneMaxRange = CreateConVar("_ai_charger3_melee_bait_maxrange", "50.0", "目标拿着近战时, 近战博弈区的最大范围, melee_range + 这个值", CVAR_FLAGS, true, 0.0);
 	// when the angle between charger's air velocity direction and the direction from charger to target exceeds this value, perform air velocity modification (air modification: set charger's current velocity direction to the target direction)

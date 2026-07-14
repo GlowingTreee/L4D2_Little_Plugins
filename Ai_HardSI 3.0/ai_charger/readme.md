@@ -167,7 +167,7 @@ public Action OnPlayerRunCmd(int client, int& buttons, ...) {
 
 > 有没有方法能够获取到这条黄色细线指向的终点坐标
 
-Gemini 回复说使用 `DHooks` 去挂钩 `PathFollower::Update` 函数，接着问他怎么知道的，Gemini 继续回答说是根据 [source 2013 sdk](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/game/server/NextBot/Path/NextBotPathFollow.cpp) 泄露的源码推测的，因为在源码中搜索 `DEBUG PATH` 等字眼发现只存在于 `NextBot` 和 `PathFollower` 等相关文件中，其中 `NextBot` 是游戏 AI 系统相关，`PathFollower` 是 AI 路径跟随相关，在 `NextBotPathFollow.cpp` 的 `PathFollower::Update` 中有一行代码
+Gemini 回复说使用 `DHooks` 去挂钩 `PathFollower::Update` 函数，接着问他怎么知道的，Gemini 继续回答说是根据公开的 [source 2013 sdk](https://github.com/ValveSoftware/source-sdk-2013/blob/master/src/game/server/NextBot/Path/NextBotPathFollow.cpp) 的源码推测的，因为在源码中搜索 `DEBUG PATH` 等字眼发现只存在于 `NextBot` 和 `PathFollower` 等相关文件中，其中 `NextBot` 是游戏 AI 系统相关，`PathFollower` 是 AI 路径跟随相关，在 `NextBotPathFollow.cpp` 的 `PathFollower::Update` 中有一行代码
 
 ```cpp
 NDebugOverlay::Line( bot->GetEntity()->WorldSpaceCenter(), goalPos, 255, 255, 0, true, 0.1f );
@@ -568,32 +568,97 @@ CHARGING (冲锋) : 冲锋结束后 ──────────> APPROACH (�
 
 ### APPROACH — 接近状态
 
-Charger 通过连跳快速接近目标生还者, 是持续时间最长的状态, Charger 生成后首先进入这个状态
+`APPROACH` 是 Charger 的默认追击状态，也是生成后最先进入、持续时间通常最长的状态。它的目标不是一味把速度向量指向生还者，而是在**遵从导航路径**与**近距离直接施压**之间动态切换：复杂地形优先沿 Nav Path 连跳，平地或路径已证明安全的近距离再使用直线连跳。
 
-**连跳行为:**
-- 起跳时每跳施加 `ai_charger3_bhop_impulse` 的加速度, 速度上限由 `ai_charger3_bhop_max_speed` 控制
-- 若目标正在看着 Charger (视角夹角小于 `ai_charger3_target_watch_maxdeg`), 连跳方向会在基准方向左右随机偏移 `[ai_charger3_bhop_strafe_mindeg, ai_charger3_bhop_strafe_maxdeg]` 度, 实现 Z 字形规避 (侧向连跳), 开启侧向连跳时若与目标距离小于 `ai_charger3_bhop_strafe_mindist` 时, 禁止侧向连跳以防止 Charger 连跳过头
-- 无目标视野时若速度方向与视角方向夹角在 `ai_charger3_bhop_nvis_maxang` 范围内, 仍允许连跳 (寻路连跳)
-- 在空中时若速度方向与到目标方向夹角超过 `ai_charger3_airvec_modify_min_deg`, 将速度方向修正为目标方向 (防止连跳过头)
+这样设计的原因是，目标坐标的直线方向不代表可通行方向。楼梯口、悬崖、断层和需要绕行的建筑结构中，直接朝目标加速会让 Charger 跳下楼或撞墙；但在开阔平地或目标刚移动导致旧路径滞后时，只沿旧 Path 又会失去追击效率。APPROACH 将这两种情况分开处理。
+
+**连跳基础条件:**
+- 连跳需开启 `ai_charger3_bhop`、Charger 当前速度达到 `ai_charger3_bhop_min_speed`，且距离不超过 `ai_charger3_bhop_max_dist`。
+- 每次地面起跳在当前速度基础上施加 `ai_charger3_bhop_impulse`，最终水平速度受 `ai_charger3_bhop_max_speed` 限制。
+- 无目标视野时，只有开启 `ai_charger3_bhop_no_vision`，且预测移动方向与当前视角夹角不超过 `ai_charger3_bhop_nvis_maxang` 时才允许继续连跳，避免无视野状态下盲目向侧后方跳跃。
+- 每次真正起跳前都会执行下一跳安全预测：检查前方 Hull 是否会正面撞墙、预测落点下方是否存在地面，以及是否会落入 `trigger_hurt` 或无地面的危险区域。
+
+**PATH Bhop — 沿导航路径连跳:**
+- PATH Bhop 是复杂地形下的默认模式。插件从 `PathFollower` 读取当前剩余 PathSegment，不直接依赖眼前很近的 `goal pos`，而是通过 `getLookAheadGoalPos` 向前遍历剩余路径，选择在当前滞空距离内可达、无墙体阻挡且高度合理的前瞻点作为起跳方向。
+- 这避免了短 PathSegment、急转弯或楼梯上密集节点让 Charger 每帧被不同的近距离目标点来回拉扯。
+- 当前路径仍有未完成 Segment 时，若 Direct Bhop 未通过安全检查，Charger 会继续沿 Path Bhop，而不会因为“离目标近”就放弃导航方向。
+- 空中时，PATH Bhop 使用保存的前瞻点作为空中修正目标；若该点已经过近或落到 Charger 当前速度方向背后，会按时间间隔重新向前寻找可达 PathSegment，避免飞越旧目标点后被向后拉回。
+
+**Direct Bhop — 朝目标直线连跳:**
+- Direct Bhop 使用 Charger 到目标当前位置的二维方向作为起跳与空中修正方向，适合平地近距离追击和目标横向移动后的快速收束。
+- 有有效 Path 时，只有距离进入 `ai_charger3_bhop_direct_dist`（当前已经处于 Direct 模式时额外加入退出缓冲，避免阈值附近反复切换）才尝试 Direct Bhop。
+- 路径证明可直冲：目标 NavArea 仍位于剩余 Path 上，且 Charger 到目标之间没有 `SegmentType != ON_GROUND` 的特殊移动 Segment 时，允许优先尝试 Direct Bhop。
+- 近距离旧路径滞后：目标已移动到旧 Path 之外，但目标可见且进入 Direct 距离时，也允许尝试 Direct Bhop；这解决了平地上目标移动后仍被旧 Path 前瞻点拖慢的问题。
+- 完全没有有效 Path 时，只要目标可见，也可以尝试 Direct Bhop；但它仍必须通过完整的地形与落点安全检查，不会因为缺少 Path 就无条件直冲。
+
+**直线连跳安全检查与模式回退:**
+- Direct Bhop 会根据当前速度和预计滞空时间推算实际可能飞到的 `routeEnd`。检查范围不是只到目标坐标，而是覆盖高速越过目标后的整段路线。
+- 使用 `hasPotentialGap2` 检查路线连续地面，支持连续坡道的高度变化，不会把无断层的长上/下坡误判为不可通行；同时使用 Hull Trace 检查路线是否被墙体或实体阻挡。
+- Direct Bhop 安全时：切换为 `BhopType_Normal`，空中修正以目标预测位置为方向。
+- Direct Bhop 不安全、但当前 Path 仍有未完成 Segment 时：回退到 PATH Bhop，继续按导航路径接近。
+- 目标不在旧 Path 上且 Direct Bhop 不安全时：说明这通常是楼梯口、断层或必须绕路的陈旧路径场景。插件会失效旧 Path 并进入 Repath 等待期，交还 `ChargerAttack::Update` 重新计算路径，而不是沿旧 Path 或目标直线方向冒险跳跃。
+- 当前 Path 已走到末端、且无法安全直冲目标时，同样等待原生重新寻路；这避免 `nb_debug PATH` 路径在楼梯口结束后 Charger 直接朝楼外或下方飞出。
+
+**侧向连跳与空中速度修正:**
+- PATH Bhop 与 Direct Bhop 共用侧向连跳机制。距离目标超过 `ai_charger3_bhop_strafe_mindist` 且本次空中修正距离足够时，基准方向会按 `ai_charger3_bhop_strafe_mindeg` 到 `ai_charger3_bhop_strafe_maxdeg` 生成左右偏移。
+- 侧向方向首次随机选择，之后左右交替；根据 `ai_charger3_bhop_strafe_once_dist` 与 `ai_charger3_bhop_strafe_twice_dist`，一次跳跃可形成一次或两次余弦侧向偏移。靠近目标时自动关闭，避免横移导致跳过目标。
+- 空中修正只改变水平速度方向，始终保留当前 `vel[2]`，让跳跃按照引擎重力自然上升和下落。
+- PATH 模式的空中修正朝前瞻导航点进行；Direct 模式则在目标可见、角度满足 `ai_charger3_airvec_modify_min_deg`/`ai_charger3_airvec_modify_max_deg` 且目标高度关系合理时，朝目标方向渐进转向。两者都保留起跳速度下限，避免空中修正造成速度突然衰减。
 
 **状态转换条件:**
-- 与目标距离 ≤ `ai_charger3_bhop_min_dist` → 转换为 **BAIT**
-- 目标持近战武器且距离进入近战博弈区 (`melee_range + ai_charger3_melee_bait_maxrange`) → 空中急停后转换为 **BAIT**
-- 落地时发现距离更近且无法躲避冲锋的目标, 且冲锋技能就绪 → 转换为 **LOCKED**
+- 目标持近战武器，目标可见且高度可达，并进入 `melee_range + _ai_charger3_melee_bait_maxrange` → **BAIT**。若此时仍在空中，会仅清除水平速度并保留竖直速度自然落地。
+- 普通/霰弹枪目标可见、高度可达，且距离 ≤ `ai_charger3_bhop_min_dist` → **BAIT**。
+- Charger 落地时发现比当前目标更近、可见、高度可达且在冲锋时间内难以躲避的生还者，并且冲锋路径安全、技能就绪 → 记录更优目标并转入 **LOCKED**。
+- 当前目标无效、死亡或处于不可抢夺控制状态时，APPROACH 不继续执行插件连跳，交还原生行为树处理目标与路径更新。
 
 ### BAIT — 博弈状态
 
-Charger 在近距离与目标周旋, 等待最佳冲锋时机。
+`BAIT` 不是单纯的“停在原地等 CD”, 而是 Charger 在近距离将**攻击性、命中率与近战风险**分开处理的决策阶段。
 
-**行为:**
-- 面对近战目标: 若与目标距离小于近战危险区范围 (melee_range + _ai_charger3_melee_bait_minrange) 时, 向后移动以规避伤害, 等待目标产生破绽以冲锋
-- 面对持枪目标: 每隔 `ai_charger3_prob_charge_chk_dur` 秒以 `ai_charger3_prob_charge_prob` 的概率发动冲锋, 若目标产生破绽则立即冲锋
-- 博弈状态持续超过 `ai_charger3_bait_max_duration` 秒后强制转换为 **LOCKED** 锁定状态以进行冲锋, 防止无限博弈
+设计目标是：对持枪目标不无谓减速, 尽快寻找冲锋窗口；对手持近战目标不直接贴脸送出近战斩杀机会, 而是在可控距离内施压、诱导目标行动, 并在目标出现破绽或退路被封死时立即冲锋。
 
-**状态转换条件:**
-- 检测到目标漏洞窗口 (近战攻击 CD 时、换弹时、切换武器时、进入右键推 CD 时等) → 转换为 **LOCKED**
-- 概率冲锋触发 → 转换为 **LOCKED**
-- 博弈超时 → 转换为 **LOCKED**
+进入 BAIT 后, Charger 会持续按右键挥拳并暂时压制原生自动冲锋。真正的冲锋只由本插件在满足安全条件后切换到 **LOCKED $\rightarrow$ CHARGING** 发起。
+
+**进入条件:**
+- 普通目标：目标可见、高度可达，且距离 ≤ `ai_charger3_bhop_min_dist` 时，由 **APPROACH** 转入 BAIT，停止继续接近型连跳。
+- 近战目标：近战博弈区为 <b>[melee_range + _ai_charger3_melee_bait_minrange, melee_range + _ai_charger3_melee_bait_maxrange]</b>。目标可见且高度可达时，只要 Charger 进入该区间上限以内，即提前由 **APPROACH** 转入 BAIT，避免连跳直接冲到近战脸上。
+- 近战目标的空中切入：若 Charger 带着上一段 APPROACH 连跳速度进入博弈区，会清除水平动量、保留垂直方向速度自然落地 (空中急停)；若该次跳跃本身是面对手持近战目标的 BAIT 博弈后跳，则保留后跳动量，避免下一帧把后跳取消。
+- 冲锋结束但技能尚未就绪时：若目标仍在对应的近距离阈值内，**CHARGING** 也会回到 BAIT，而不是立即重新进入远距离接近流程。
+
+**通用决策顺序:**
+1. 验证目标有效、存活，并更新最近可见时间。
+2. 落地后先检查目标高度；高度不可达时回到 **APPROACH**，重新使用导航路径接近。
+3. 落地后优先搜索更优的不可躲避冲锋目标；若存在、技能就绪且高度/路径安全，直接锁定该目标。
+4. 检查 BAIT 是否应退出；只有通过这些安全与状态检查后，才进入近战、霰弹枪或普通持枪目标的具体策略。
+
+**近战博弈详情:**
+- **安全冲锋前提**：近战目标的直接冲锋必须同时满足 Charger 落地、目标可见、冲锋技能就绪、目标高度可达、冲锋直线未被障碍物阻挡。未满足时，Charger 不会为了“概率冲锋”无视地形强行冲出。
+- **漏洞优先**：满足安全冲锋前提后，先检查 `isTargetVulnerable`。该检查覆盖目标无有效武器、换弹/攻击冷却、右键推的间隔、周围观察压力，以及目标沿 Charger 冲锋方向前方存在墙体或坠落风险等战术窗口。目标出现漏洞时立即转入 **LOCKED**，其优先级高于后跳与距离维持。
+- **博弈时间上限**：若满足安全冲锋前提且 BAIT 持续时间达到 `ai_charger3_bait_max_duration`，强制锁定目标，防止双方无限对峙；若超时但当前不具备安全冲锋条件，则返回 **APPROACH** 重新组织接近路线。
+- **概率冲锋**：未出现明确漏洞时，仍按 `ai_charger3_prob_charge_chk_dur` 与 `ai_charger3_prob_charge_prob` 进行概率决策。当目标没有看向 Charger、没有其他生还者观察 Charger，或 Charger 血量高于近战斩杀线时，允许用概率冲锋保持进攻性。
+- **快速压近**：目标以较高速度压入近战危险区 (`dist <= melee_range + ai_charger3_melee_bait_minrange`)，或距离进入紧急近战范围时 (`dist <= melee_range + 20.0`)，Charger 优先执行向后连跳。后跳速度会根据目标追击/后撤速度调整，使目标主动压迫时拉开距离更快。
+- **后跳退路不安全**：后跳预测落点不安全时，不会盲目跳下悬崖或撞入障碍；若此时满足安全冲锋前提，则立即转为冲锋，把“退无可退”转化为攻击机会。
+- **慢速距离博弈**：目标正在看着 Charger 时，Charger 使用原生移动输入与目标保持距离：目标持续后退时自然前进跟随，目标慢速压近或距离偏近时自然后退，距离偏远时自然接近。这样既维持博弈距离，也保留正常的地面加减速与动画表现。
+- **中心威慑区**：目标静止且 Charger 位于博弈区中央时，Charger 停止地面位移、持续跳跃并挥拳，制造压迫感；先让残余地面速度自然衰减，再开始原地跳跃，避免带着横向惯性跳过目标。
+- **原生后退也不安全**：慢速后退的下一帧位置不安全时，优先再次检查安全冲锋；可冲锋则锁定，不可冲锋则不接管移动，交还原生导航处理，避免人为输入把 Charger 推入危险地形。
+- **目标未观察 Charger**：不进行刻意前后距离博弈，保留给漏洞检测、概率冲锋与原生导航决策处理；目标没有直接近战威胁时，Charger 不必为了维持几单位距离而暴露移动意图。
+
+**非近战目标:**
+- 面对霰弹枪目标，在目标可见、距离仍处于 `ai_charger3_bhop_min_dist` 内且技能就绪时，优先转入 **LOCKED**，避免在霰弹枪有效距离内拖延。
+- 面对其他持枪目标，目标出现漏洞时立即锁定；若无明确漏洞，则结合 Charger 当前血量与概率冲锋配置决定是否主动冲锋。
+- 对非近战目标处于空中时，BAIT 使用空中追击线修正，持续把水平速度转向目标预测位置，同时保留竖直速度，避免 Charger 从目标侧面飞过后才落地再回头。
+
+**暂不冲锋的情况:**
+- 目标正被 Hunter 或另一只 Charger 占有不可抢夺的控制权时，继续保持 BAIT 博弈状态而暂不转换为冲锋状态，继续挥拳而不浪费冲锋。
+- 近战后跳仍在空中时，不会因瞬时丢失视野、距离变化或高度变化中途退出 BAIT；必须先让该次后跳自然结束。
+
+**退出与状态转换条件:**
+- 目标无效或死亡 → **APPROACH**，重新选择追击目标。
+- Charger 落地后发现目标高度不可达 → **APPROACH**。
+- 连续丢失目标视野达到 3 秒 → **APPROACH**。
+- 普通/霰弹枪目标距离大于 `ai_charger3_bhop_min_dist + STATE_TOLERANCE_DIST` → **APPROACH**。
+- 近战目标距离大于 `melee_range + _ai_charger3_melee_bait_maxrange + STATE_TOLERANCE_DIST` → **APPROACH**。
+- 发现更优不可躲避冲锋目标、目标出现漏洞、概率冲锋命中、博弈超时且可安全冲锋、后跳/后退退路不安全但可安全冲锋 → **LOCKED**。
 
 ### LOCKED — 锁定状态
 
@@ -616,7 +681,7 @@ Charger 发动冲锋并处理冲锋结束后的逻辑。
 旧版本 Ai Charger 将所有逻辑平铺在 `OnPlayerRunCmd` 中, Ai Charger 3.0 版本在架构和功能上均有大幅改进:
 
 | 对比项 | 旧版本 | 3.0 版本 |
-|---|---|---|
+| --- | --- | --- |
 | **代码架构** | 所有逻辑平铺在 `OnPlayerRunCmd`, 条件嵌套深 | 状态机架构, 每个状态独立封装, 职责清晰 |
 | **博弈行为** | 无博弈逻辑, 接近到一定距离直接冲锋 | 独立 BAIT 状态, 针对近战/持枪目标有不同博弈策略 |
 | **连跳** | 仅支持直线连跳 | 支持基于导航路径的连跳以及速度达到一定程度时可进行 S 形侧向连跳规避目标枪线, 角度随机化 (S 型空中速度修正使用余弦函数干预当前速度方向，位于 `state_approach.inc` 的 `executeAirCorrection(...)` 中，可以借助大语言模型辅助理解) |
@@ -646,20 +711,10 @@ Charger 发动冲锋并处理冲锋结束后的逻辑。
 
    1. 主流连跳方式分析中基于导航路径 `PATH` 的连跳的劣势问题导致 Charger 无法有效追击目标，这个方法见仁见智吧，后续会上传普通版本 (使用之前的基于到目标方向作为连跳加速方向) 的 `state_approach.inc` 用于替换连跳方法 (主要替换 `executeGroundBhop` 地面开始连跳和 `executeAirCorrection` 空中速度方向修正函数)
    2. 以及冲锋前目标位置预测算法的不准确，导致部分场景 Charger 就算已经到达了 `lastBhopDist` 理论的冲锋目标无法躲避距离，也仍然不能准确命中目标
-   3. 若目标手持近战向 Charger 靠近, Charger 在空中进入 melee bait range 时无法后跳, 需要等待落地进行概率后跳, Charger 进入 melee bait range 后会急停, 等待落地概率后跳, 此时生还者继续向前大概率可以使用近战攻击到 Charger
 
 ## 更新日志
 
 <details>
 <summary>2026-03-03</summary>
 1. 上传插件<br>
-</details>
-
-<details>
-<summary>2026-06-27</summary>
-1. 修复连跳寻路问题, 03-03 版本中的 Charger 连跳进入 min strate dist 范围后且到目标直线距离没有 Gap (调用游戏原生 HasPotentialGap 判断), 或当前 PATH 无效 (PATH is null 或者 Charger 已走完当前 PATH), 直接朝着目标方向直线连跳, 但这忽略了地形 (比如 c4m2 糖厂楼梯口 PATH 断裂 Charger 直接朝着另一侧的目标直线连跳导致摔下楼梯)；当前版本改为进入 min strafe dist 或 PATH 无效时需要通过额外的 isDirectBhopSafe 检查, 若检查通过才允许直线连跳；若当前 PATH 仍然有效, 若 Charger 当前 NavArea 不在 PATH 上, 则尝试无效化当前 PATH, 交给 ChargerAttack::Update 中触发重新寻路, Charger 未走完当前 PATH 时继续沿着当前 PATH 连跳<br>
-2. 修复除了 state approach 之外的其他 state 没有空中速度修正, 导致 state approach 时若在空中达到 bait dist 切换至 state bait, 解除空中速度修正, 导致 charger 飞过头；现版本在 stage bait, state locked, state charging 中也加入了空中速度修正代码<br>
-3. 修复 state charging 状态下进行冲锋前最后一跳时在空中 Z 轴速度 vel[2] 并未保留原始速度向量的 vel[2] 导致可能会贴在目标脸上无法落地的问题；当前版本若最后一跳也无法进入 commit charge dist 那么回退到 state approach 尝试重新接近目标<br>
-4. 优化 state bait 与 state charging 的退出条件<br>
-5. 修复无技能追击问题, 之前使用基于 ILocomotion::Approach 与 ILocomotion::FaceTowards 的方法会导致 Charger 无法正常触发寻路, 若目标在楼梯上则 Charger 并不会上楼梯 (如 c4m2 糖厂楼梯, Charger 仅会在楼下尝试移动到目标坐标)；当前版本使用拦截 ChargerEvade 行为并在其中使用 BotCmdMove 创建 BehaviorMoveTo 行为让 Charger 寻路并移动到目标位置, 同时不立刻结束 ChargerEvade 行为节点 (若 BheaviorMoveTo 行为节点创建后立即结束 ChargerEvade 行为节点会导致 BehaviorMoveTo 行为节点一起销毁)；但是 Actions 拓展无法正常捕获 BehaviorMoveTo 行为的创建, 因此不能照搬 Ai-Smoker3 的做法, 只能退一步在 OnPlayerRunCmd 中检查目标坐标变化并无效化当前 BehaviorMoveTo 行为
 </details>

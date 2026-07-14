@@ -122,13 +122,10 @@ stock Action StateBait_OnUpdate(int client, int& buttons, float vel[3], float an
         static int betterTarget;
         betterTarget = getChargeUnavoidableTarget(client, target, pos, dist, g_cvBhopMinDist.FloatValue);
         if (IsValidSurvivor(betterTarget) && IsPlayerAlive(betterTarget) &&
-            isChargeAbilityReady(client) &&
-            isChargeTargetHeightReachable(client, betterTarget) &&
-            !isChargePathBlocked(client, betterTarget)
+            canCommitBaitCharge(client, betterTarget, visible)
         ) {
-            stateLog.debugAll("Charger (%N) find a better charge target %N, transition to LOCKED STATE", client, betterTarget);
             g_AiChargers[client].m_iBetterTarget = GetClientUserId(betterTarget);
-            g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+            transitionBaitToLocked(client, betterTarget, "Found closer unavoidable charge target, forcing charge!");
             return Plugin_Changed;
         }
     }
@@ -168,23 +165,29 @@ stock Action StateBait_OnUpdate(int client, int& buttons, float vel[3], float an
     // ============================================================
     static Action resAction;
     if (threatType == Threat_Melee) {
-        // handleMeleeThreat 的返回值为 Plugin_Changed 表示执行了后跳动作, 需要结束这一帧
-        resAction = handleMeleeThreat(client, target, dist, visible, isWatching, watchers, buttons);
-        if (resAction != Plugin_Continue)
-            return resAction;
         /*
-        * 如果 handleMeleeThreat 中不能冲锋, 也不允许向后跳, 或向后跳失败了, 且 Charger 在地上
+        * handleMeleeThreat 的返回值为 Plugin_Changed
+        * 1. 表示当前 Charger 状态已经转换到 CHARGING STATE, 准备冲锋
+        * 2. 表示 Charger 不满足冲锋条件但是允许后跳, performBackwardBhop 后跳输入之后, 结束本帧
+        */
+        resAction = handleMeleeThreat(client, target, dist, visible, isWatching, watchers, buttons);
+        if (resAction != Plugin_Continue) {
+            return resAction;
+        }
+        /*
+        * 如果 handleMeleeThreat 中因为不满足冲锋条件导致不能冲锋, 也不允许向后跳, 或向后跳失败了, 且 Charger 在地上
         * 那么如果目标正在看着 Charger, Charger 进入 baitZoneMin 那么 Charger 后退, 出了 baitZoneMax 朝着目标前进进行近战博弈
-        * 若向后移动方向不安全, 且技能就绪, 那么直接冲锋
+        * 若向后移动方向不安全, 且此时基础冲锋条件满足, 那么直接冲锋
         */
         static Action distanceControlResult;
-        distanceControlResult = maintainMeleeBaitDistance(client, target, dist, visible, vel, buttons);
-        if (distanceControlResult != Plugin_Continue)
+        distanceControlResult = maintainMeleeBaitDistance(client, target, dist, visible, isWatching, vel, ang, buttons);
+        if (distanceControlResult != Plugin_Continue) {
             return distanceControlResult;
+        }
     } else if (threatType == Threat_Shotgun) {
-        resAction = handleShotgunThreat(client, target, dist, visible);
+        resAction = handleShotgunThreat(client, target, visible);
     } else {
-        resAction = handleNonMeleeThreat(client, target, dist, visible);
+        resAction = handleNonMeleeThreat(client, target, visible);
     }
 
     if (resAction != Plugin_Continue)
@@ -206,36 +209,122 @@ stock Action StateBait_OnUpdate(int client, int& buttons, float vel[3], float an
 * @error 
 **/
 
-#define BAIT_RETREAT_NONE       0
-#define BAIT_RETREAT_BACK       1
-#define BAIT_RETREAT_FORWARD    -1
+void clearBaitGroundMoveInput(int& buttons, float cmdVel[3]) {
+    buttons &= ~(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
 
-Action maintainMeleeBaitDistance(int client, int target, float dist, bool visible, float cmdVel[3], int& buttons) {
-    static float pos[3], targetPos[3], currentVel[3], awayDir[3];
+    cmdVel[0] = 0.0;
+    cmdVel[1] = 0.0;
+}
+
+/**
+* 执行按照 wordDir 方向的具体移动
+* @param worldDir 世界坐标方向向量, 想要 Charger 移动到的方向向量, desiredDir
+* @param moveSpeed 想要 Charger 进行移动的速度大小
+* @param viewAngles Charger 的视角向量
+* @param buttons 输入按键
+* @param cmdVel Charger 输入速度向量
+* @return void
+* @error 
+**/
+void applyBaitGroundMoveInput(const float worldDir[3], float moveSpeed, const float viewAngles[3], int& buttons, float cmdVel[3]) {
+    static float fwd[3], right[3];
+
+    GetAngleVectors(viewAngles, fwd, NULL_VECTOR, NULL_VECTOR);
+    GetAngleVectors(viewAngles, NULL_VECTOR, right, NULL_VECTOR);
+
+    fwd[2] = right[2] = 0.0;
+
+    if (NormalizeVector(fwd, fwd) <= 0.0 || NormalizeVector(right, right) <= 0.0) {
+        clearBaitGroundMoveInput(buttons, cmdVel);
+        return;
+    }
+
+    static float fwdMove, sideMove;
+    fwdMove = GetVectorDotProduct(worldDir, fwd) * moveSpeed;
+    sideMove = GetVectorDotProduct(worldDir, right) * moveSpeed;
+
+    clearBaitGroundMoveInput(buttons, cmdVel);
+
+    /*
+    * 进行真正的移动逻辑, 使用 desiredDir * moveSpeed 计算出实际向 desiredDir 方向的移动速度分量
+    * 如果 fwd 方向和 desierdDir 方向相反, 那么 fwdMove < 0, 相同则 fwdMove > 0, 即控制 Charger 前进或后退
+    * 如果 right 方向和 desiredDir 方向相反, 那么 sideMove < 0, 相同则 sideMove > 0, 即控制 Charger 向右移动或向左移动
+    */
+    cmdVel[0] = fwdMove;
+    cmdVel[1] = sideMove;
+
+    if (fwdMove > 1.0) {
+        buttons |= IN_FORWARD;
+    } else if (fwdMove < -1.0) {
+        buttons |= IN_BACK;
+    }
+
+    if (sideMove > 1.0) {
+        buttons |= IN_MOVERIGHT;
+    } else if (sideMove < -1.0) {
+        buttons |= IN_MOVELEFT;
+    }
+}
+
+/**
+* 维护 Charger 和目标之间的近战博弈距离, 保持在 baitZoneMin 到 baitZoneMax 之间
+* @param client Charger 客户端索引
+* @param target 目标客户端索引
+* @param dist 到目标的距离
+* @param visible 是否可见目标
+* @param isWatching 目标是否正在看着 Charger
+* @param cmdVel Charger 当前输入速度向量
+* @param viewAngles Charger 的视角向量
+* @param buttons 输入按键
+* @return Action
+* @error 
+**/
+Action maintainMeleeBaitDistance(int client, int target, float dist, bool visible, bool isWatching, float cmdVel[3], const float viewAngles[3], int& buttons) {
+    static float pos[3], targetPos[3], currentVel[3], targetVel[3], currentVel2D[3], targetVel2D[3];
+    static float awayDir[3], towardDir[3];
+
     GetClientAbsOrigin(client, pos);
     GetClientAbsOrigin(target, targetPos);
     GetEntPropVector(client, Prop_Data, "m_vecAbsVelocity", currentVel);
+    GetEntPropVector(target, Prop_Data, "m_vecAbsVelocity", targetVel);
 
     // awayDir = target -> Charger
     MakeVectorFromPoints(targetPos, pos, awayDir);
     awayDir[2] = 0.0;
-
-    if (NormalizeVector(awayDir, awayDir) <= 0.0)
+    if (NormalizeVector(awayDir, awayDir) <= 0.0) {
         return Plugin_Continue;
+    }
 
-    // currentAwaySpeed > 0 表示 Charger 正沿 target -> Charger 方向远离目标。
-    static float currentAwaySpeed;
-    currentAwaySpeed = GetVectorDotProduct(currentVel, awayDir);
+    // towardDir = Charger -> target
+    towardDir[0] = -awayDir[0];
+    towardDir[1] = -awayDir[1];
+    towardDir[2] = 0.0;
 
-    // 后跳起飞后保留远离目标的动量, 不再被下一帧的距离控制清零
+    currentVel2D = currentVel;
+    targetVel2D = targetVel;
+
+    currentVel2D[2] = 0.0;
+    targetVel2D[2] = 0.0;
+
+    // targetApproachSpeed 是正数表示目标正在朝着 Charger 接近, 负数表示目标正在远离 Charger
+    static float targetApproachSpeed, currentGroundSpeed;
+    targetApproachSpeed = GetVectorDotProduct(targetVel2D, awayDir);
+    currentGroundSpeed = getVectorLength2D(currentVel2D);
+
+    /*
+    * 后跳起飞后保留远离目标的动量, 不再被下一帧的距离控制清零
+    * 若是从 APPROACH STATE 的最后一次连跳在空中进入 BAIT STATE, 那么保留 vel[2] 让 Charger 自然落地
+    */
     if (!IsClientOnGround(client)) {
-        // 先清除原生的移动输入
-        buttons &= ~(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
-        cmdVel[0] = 0.0;
-        cmdVel[1] = 0.0;
+        clearBaitGroundMoveInput(buttons, cmdVel);
 
         // 如果 BhopType 是 BhopType_BaitRetreat, 且当前的 Charger 后跳速度分量有效, 那么说明在空中的这次连跳确实由后跳发起, 保持后跳
-        if (g_AiChargers[client].m_BhopType == BhopType_BaitRetreat && currentAwaySpeed > 1.0) {
+        static float currentAwaySpeed;
+        currentAwaySpeed = GetVectorDotProduct(currentVel, awayDir);
+
+        if (g_AiChargers[client].m_BhopType == BhopType_BaitRetreat &&
+            currentAwaySpeed > 1.0)
+        {
             return Plugin_Changed;
         }
 
@@ -243,18 +332,25 @@ Action maintainMeleeBaitDistance(int client, int target, float dist, bool visibl
         currentVel[0] = 0.0;
         currentVel[1] = 0.0;
         TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, currentVel);
+
         g_AiChargers[client].m_BhopType = BhopType_None;
         g_AiChargers[client].m_flLastHopSpeed = 0.0;
+
         return Plugin_Changed;
     }
 
     if (g_AiChargers[client].m_BhopType == BhopType_BaitRetreat) {
         g_AiChargers[client].m_BhopType = BhopType_None;
         g_AiChargers[client].m_flLastHopSpeed = 0.0;
+        ZeroVector(g_AiChargers[client].m_vecAirCorrGoal);
+        g_AiChargers[client].m_AirStrafe.init();
     }
 
-    // 只有目标正在看着 Charger 时才进行距离博弈, 否则目标不看着 Charger, 安全, 不需要进行近战博弈操作
-    if (!isTargetWatchingCharger(client, target))
+    /*
+    * 只有目标正在看着 Charger 时才进行距离博弈, 否则目标不看着 Charger, 安全, 不需要进行近战博弈操作
+    * 保留给 handleMeleeThreat 处理, 进行目标是否易受攻击, 概率冲锋等决策
+    */
+    if (!isWatching)
         return Plugin_Continue;
 
     static float meleeRange, baitZoneMin, baitZoneMax;
@@ -262,52 +358,81 @@ Action maintainMeleeBaitDistance(int client, int target, float dist, bool visibl
     baitZoneMin = meleeRange + g_cvMeleeBaitZoneMinRange.FloatValue;
     baitZoneMax = meleeRange + g_cvMeleeBaitZoneMaxRange.FloatValue;
 
-    static int moveSign;
-    moveSign = BAIT_RETREAT_NONE;
+    static float baitZoneCenter, baitZoneQuarter;
+    baitZoneCenter = (baitZoneMin + baitZoneMax) * 0.5;
+    baitZoneQuarter = (baitZoneMax - baitZoneMin) * 0.25;
 
+    // Charger 处于 baitZoneCenter +- baitZoneQuarter 区域内, 若目标不动, 此时原地跳跃打拳威慑
+    static float baitHopMin, baitHopMax;
+    baitHopMin = baitZoneCenter - baitZoneQuarter;
+    baitHopMax = baitZoneCenter + baitZoneQuarter;
+
+    static bool moveTowardTarget, moveAwayFromTarget;
+    moveTowardTarget = moveAwayFromTarget = false;
+
+    /*
+    * 优先修正距离越界, 目标开始接近 Charger, 那么必须后退, 如果目标开始远离 Charger, 那么必须前进
+    */
     if (dist < baitZoneMin) {
-        // 距离过近, 沿 awayDir 后退
-        moveSign = BAIT_RETREAT_BACK;
+        moveAwayFromTarget = true;
     } else if (dist > baitZoneMax) {
-        // 距离过远, 朝目标前进
-        moveSign = BAIT_RETREAT_FORWARD;
-    }
-
-    if (moveSign == 0) {
-        buttons &= ~(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
-        cmdVel[0] = 0.0;
-        cmdVel[1] = 0.0;
-        currentVel[0] = 0.0;
-        currentVel[1] = 0.0;
-        TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, currentVel);
+        moveTowardTarget = true;
+    } else if (targetApproachSpeed <= -50.0) {
+        // 目标持续后退, 使用原生移动跟随
+        moveTowardTarget = true;
+    } else if (targetApproachSpeed >= 50.0) {
+        // 目标慢速压近, 快速压近已经在 handleMeleeThreat 中优先后跳处理, 这里处理不能后跳的情况
+        moveAwayFromTarget = true;
+    } else if (dist < baitHopMin) {
+        // Charger 偏近, 自然后退回 baitZoneCenter 区域
+        moveAwayFromTarget = true;
+    } else if (dist > baitHopMax) {
+        // Charger 偏远, 自然前进去到 baitZoneCenter 区域
+        moveTowardTarget = true;
+    } else {
+        // 刚好位于 baitZoneCenter +- baitZoneQuarter 区域, 开始原地跳跃并打拳
+        clearBaitGroundMoveInput(buttons, cmdVel);
+        
+        if (currentGroundSpeed <= 50.0) {
+            buttons |= IN_ATTACK2;
+            buttons |= IN_DUCK;
+            buttons |= IN_JUMP;
+        }
         return Plugin_Changed;
     }
 
-    static float baseSpeed, moveSpeed;
-    baseSpeed = SDKCall(g_hSdkGetRunTopSpeed, client);
-    moveSpeed = baseSpeed;
+    static float runTopSpeed;
+    runTopSpeed = SDKCall(g_hSdkGetRunTopSpeed, client);
 
-    static float desiredVel[3];
-    desiredVel[0] = awayDir[0] * moveSpeed * float(moveSign);
-    desiredVel[1] = awayDir[1] * moveSpeed * float(moveSign);
+    static float desiredDir[3], desiredVel[3];
+
+    if (moveAwayFromTarget) {
+        // 需要远离目标的时候
+        desiredDir = awayDir;
+    } else {
+        desiredDir = towardDir;
+    }
+
+    desiredVel[0] = desiredDir[0] * runTopSpeed;
+    desiredVel[1] = desiredDir[1] * runTopSpeed;
     desiredVel[2] = 0.0;
 
     if (!nextTickPosCheck(client, desiredVel, visible)) {
-        // 无论前进还是后退, 方向不安全都不接管移动
-        // handleMeleeThreat 已在这个函数之前执行, 此时保留其朝着目标右键打拳或者冲锋决策及原生 PathFollower 输入
+        // 目标慢速靠近 Charger 时, 如果原生后退也不安全, 那么继续尝试冲锋
+        if (moveAwayFromTarget && canCommitBaitCharge(client, target, visible)) {
+            transitionBaitToLocked(client, target, "Native bait retreat direction unsafe, forcing charge!");
+            return Plugin_Changed;
+        }
         return Plugin_Continue;
     }
 
-    buttons &= ~(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
-    cmdVel[0] = 0.0;
-    cmdVel[1] = 0.0;
-    desiredVel[2] = currentVel[2];
-    TeleportEntity(client, NULL_VECTOR, NULL_VECTOR, desiredVel);
+    applyBaitGroundMoveInput(desiredDir, runTopSpeed, viewAngles, buttons, cmdVel);
 
     g_AiChargers[client].m_BhopType = BhopType_None;
     g_AiChargers[client].m_flLastHopSpeed = 0.0;
     ZeroVector(g_AiChargers[client].m_vecAirCorrGoal);
     g_AiChargers[client].m_AirStrafe.init();
+
     return Plugin_Changed;
 }
 
@@ -372,6 +497,10 @@ bool shouldExitBaitState(int client, int target, float dist, bool visible, Targe
 * @return void
 **/
 Action handleMeleeThreat(int client, int target, float dist, bool visible, bool isWatching, int watchers, int& buttons) {
+    // Charger 需要在地上
+    if (!IsClientOnGround(client))
+        return Plugin_Continue;
+
     static int health;
     health = GetEntProp(client, Prop_Data, "m_iHealth");
 
@@ -380,17 +509,50 @@ Action handleMeleeThreat(int client, int target, float dist, bool visible, bool 
     baitZoneMin = meleeRange + g_cvMeleeBaitZoneMinRange.FloatValue;
     baitZoneMax = meleeRange + g_cvMeleeBaitZoneMaxRange.FloatValue;
 
-    // 如果已经出了博弈区, 允许原生移动继续朝着目标接近
-    if (dist > baitZoneMax)
+    /*
+    * ShouldExitBaitState 允许 baitZoneMax + stateTolerance, 这里应该也保持这个区间
+    * 如果距离超过了 biatZoneMax + StateTolerance, 那么直接退出 BAIT STATE
+    */
+    if (dist > (baitZoneMax + STATE_TOLERANCE_DIST))
         return Plugin_Continue;
 
-    // 冲锋的收益高于后跳, 如果满足冲锋条件, 那么优先冲锋
-    if (IsClientOnGround(client) &&
-        shouldChargeInMeleeBait(client, target, health, visible, isWatching, watchers) &&
-        isChargeAbilityReady(client)
-    ) {
-        stateLog.debugAll("Charger (%N) melee bait: charging holding melee target (%N), dist %.2f, transition to LOCKED STATE", client, target, dist);
-        g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+    // 检查当前是否超出博弈最大时长
+    static bool baitTimeout;
+    baitTimeout = isBaitTimeout(client);
+
+    /*
+    * 首先检查是否满足基础冲锋条件, 接着检查目标是否处于易受攻击状态, 是否超出最大博弈时长和是否允许概率冲锋
+    */
+    if (canCommitBaitCharge(client, target, visible)) {
+        // 1. 目标处于易受攻击状态, 允许直接冲锋
+        if (isTargetVulnerable(client, target)) {
+            transitionBaitToLocked(client, target, "Target is vulnerable");
+            return Plugin_Changed;
+        }
+
+        // 2. 超出最大博弈时长, 强制冲锋
+        if (baitTimeout) {
+            transitionBaitToLocked(client, target, "Bait max duration exceeded");
+            return Plugin_Changed;
+        }
+
+        /*
+        * 3. 当前是否允许朝着手持近战目标概率冲锋
+        * 需要目标没有看着 Charger 且没有其他生还者看着 Charger 或 Charger 血量大于近战斩杀线
+        */
+        if (shouldProbolisticMeleeCharge(client, isWatching, watchers, health)) {
+            transitionBaitToLocked(client, target, "Probabilistic charge");
+            return Plugin_Changed;
+        }
+    } else if (baitTimeout) {
+        /*
+        * 此时是基础冲锋条件不满足 (不可见目标/高度不可达/冲锋路径阻挡等), 但是超出了最大博弈时长
+        * 应该退出 BaitState, 返回 STATE_APPROACH 重新寻路
+        */
+        stateLog.debugAll("Charger (%N) bait timeout but cannot safely charge target (%N), transition to APPROACH STATE",
+            client, target);
+        
+        g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
         return Plugin_Changed;
     }
 
@@ -406,7 +568,10 @@ Action handleMeleeThreat(int client, int target, float dist, bool visible, bool 
 
     MakeVectorFromPoints(targetPos, chargerPos, targetToCharger);
     targetToCharger[2] = 0.0;
-    NormalizeVector(targetToCharger, targetToCharger);
+
+    if (NormalizeVector(targetToCharger, targetToCharger) <= 0.0)
+        return Plugin_Continue;
+    
     targetVel[2] = 0.0;
 
     // 计算目标速度和 Charger -> target 方向的分量, 如果 targetApproachSpeed > 0 表示目标正在朝着 Charger 主动接近, 此时应该向后跳
@@ -423,44 +588,59 @@ Action handleMeleeThreat(int client, int target, float dist, bool visible, bool 
 
     // 无法冲锋时, 目标主动进入 baitZoneMin 或已经过近才尝试后跳
     if (targetPressing || emergencyClose) {
-        static Action backhopResult;
-        backhopResult = performBackwardBhop(client, target, visible, buttons);
-        if (backhopResult != Plugin_Continue)
-            return backhopResult;
+        return performBackwardBhop(client, target, visible, buttons);
     }
 
     return Plugin_Continue;
 }
 
 /**
-* Charger 在面对手持近战的目标时, 且距离处于博弈区内 (baitZoneMin, baitZoneMax], 判断是否冲锋
+* Charger 处于 StateBait 时能否冲锋的基础检查
+* 1. Charger 需要在地上
+* 2. Charger 需要可见目标
+* 3. Charger 冲锋能力就绪
+* 4. Charger 冲锋目标高度可达
+* 5. Charger 冲锋路径不被阻挡
 * @param client 客户端索引
 * @param target 目标索引
-* @param dist 距离
-* @param health Charger 生命值
-* @param isWatching 目标是否正在看着 Charger
-* @param watchers 正在看着 Charger 的人数
+* @param visible 是否可见目标
 * @return bool
+* @error
 **/
-bool shouldChargeInMeleeBait(int client, int target, int health, bool visible, bool isWatching, int watchers) {
-    // 能力未就绪, 不允许冲锋
-    if (!isChargeAbilityReady(client))
-        return false;
-    // 0. 无目标视野, 不允许冲锋
-    if (!visible)
-        return false;
-    // 1. 目标手持近战, 但是没有看着自己, 且没有其他生还者看着自己, 概率冲锋
-    if (!isWatching && watchers <= 0 && isChargerProbCharge(client))
-        return true;
-    // 2. 目标手持近战, 且处于易受攻击状态, 直接冲锋
-    if (isTargetVulnerable(client, target))
-        return true;
-    // 3. 目标手持近战, 且不处于易受攻击状态, Charger 血量大于近战斩杀线时, 概率冲锋
+bool canCommitBaitCharge(int client, int target, bool visible) {
+    return (IsClientOnGround(client) &&
+            visible &&
+            isChargeAbilityReady(client) &&
+            isChargeTargetHeightReachable(client, target) &&
+            !isChargePathBlocked(client, target));
+}
+
+void transitionBaitToLocked(int client, int target, const char[] reason) {
+    stateLog.debugAll("Charger (%N) trainsition to LOCKED STATE, target (%N), reason: %s",
+        client, target, reason);
+
+    g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+}
+
+bool isBaitTimeout(client) {
+    return g_ChargerStateContext[client].getStateDuration() >= g_cvBaitMaxDuration.FloatValue;
+}
+
+bool shouldProbolisticMeleeCharge(int client, bool isWatching, int watchers, int health) {
     static int meleeDamageCharger;
     meleeDamageCharger = !cvMeleeDamageCharger ? DEFAULT_MELEE_DMG_CHARGER : cvMeleeDamageCharger.IntValue;
-    if (health > meleeDamageCharger && isChargerProbCharge(client))
-        return true;
-    return false;
+
+    /*
+        一帧最多决策一次, 概率冲锋条件为
+        1. 目标没有看着 Charger, 且没有其他人看着 Charger
+        2. Charger 血量大于近战斩杀线时, 概率冲锋
+    */
+    bool canProbCharge = (
+                            (!isWatching && watchers <= 0) ||
+                            (health > meleeDamageCharger)
+                        );
+                    
+    return canProbCharge && isChargerProbCharge(client);
 }
 
 /**
@@ -520,11 +700,10 @@ Action performBackwardBhop(int client, int target, bool visible, int& buttons) {
     // 应用缩放
     ScaleVector(vBack, backSpeed);
 
-    // 连跳后退的落点不安全的时候, 则转为冲锋状态
+    // 连跳后退的落点不安全的时候, 则转为冲锋状态, 使用统一的基础冲锋检查函数来检查冲锋是否安全
     if (!nextTickPosCheck(client, vBack, visible)) {
-        if (!isChargePathBlocked(client, target) && isChargeAbilityReady(client)) {
-            stateLog.debugAll("Charger (%N) bait to holding melee target (%N), backward jump unsafe, transition to LOCKED STATE", client, target);
-            g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+        if (canCommitBaitCharge(client, target, visible)) {
+            transitionBaitToLocked(client, target, "Backward bhop landing pos unsafe, forcing charge!");
             return Plugin_Changed;
         }
 
@@ -551,20 +730,25 @@ Action performBackwardBhop(int client, int target, bool visible, int& buttons) {
 * @param visible 是否可见目标
 * @return Action
 **/
-Action handleShotgunThreat(int client, int target, float dist, bool visible) {
-    // 能力未就绪, 不允许冲锋
-    if (!isChargeAbilityReady(client))
+Action handleShotgunThreat(int client, int target, bool visible) {
+    // Charger 需要在地面
+    if (!IsClientOnGround(client))
         return Plugin_Continue;
-    // 无目标视野, 或者距离大于 bhopMinDist, 不允许冲锋
-    if (!visible || dist > g_cvBhopMinDist.FloatValue)
+    // 如果不满足基础冲锋条件, 检查博弈是否超时, 若博弈超时, 转换到 APPROACH STATE, 不冒险冲锋
+    if (!canCommitBaitCharge(client, target, visible)) {
+        if (isBaitTimeout(client)) {
+            stateLog.debugAll("Charger (%N) bait timeout against shotgun target (%N), cannot safely charge, transition to APPROACH STATE",
+                client, target);
+            
+            g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
+            return Plugin_Changed;
+        }
         return Plugin_Continue;
-    // 能力未就绪, 不允许冲锋
-    if (!isChargeAbilityReady(client))
-        return Plugin_Continue;
+    }
 
-    stateLog.debugAll("Charger (%N) handling shotgun threat, charging to target (%N), transition to LOCKED STATE", client, target);
-    g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
-    return Plugin_Continue;
+    // 遇到手持霰弹枪的目标, 直接冲锋
+    transitionBaitToLocked(client, target, "Shotgun target in safe charge range, forcing charge!");
+    return Plugin_Changed;
 }
 
 /**
@@ -581,34 +765,57 @@ Action handleShotgunThreat(int client, int target, float dist, bool visible) {
 * @param watchers 正在看着 Charger 的人数
 * @return Action
 **/
-Action handleNonMeleeThreat(int client, int target, float dist, bool visible) {
-    // 能力未准备就绪, 不允许冲锋
-    if (!isChargeAbilityReady(client))
-        return Plugin_Continue;
-    // 无目标视野, 或距离大于最小连跳允许距离, 不允许冲锋
-    if (!visible || dist > g_cvBhopMinDist.FloatValue)
-        return Plugin_Continue;
-    // 能力未就绪, 不允许冲锋
-    if (!isChargeAbilityReady(client))
+Action handleNonMeleeThreat(int client, int target, bool visible) {
+    // Charger 需要在地上才进行处理
+    if (!IsClientOnGround(client))
         return Plugin_Continue;
 
-    // 如果目标处于易受攻击状态, 直接冲锋
-    if (isTargetVulnerable(client, target)) {
-        stateLog.debugAll("Charger (%N) handling non-melee threat: target (%N) vulnerable, charging", client, target);
-        g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+    static bool baitTimeout;
+    baitTimeout = isBaitTimeout(client);
+
+    // 如果不满足基础冲锋条件, 检查博弈是否超时, 若博弈超时, 转换到 APPROACH STATE, 不冒险冲锋
+    if (!canCommitBaitCharge(client, target, visible)) {
+        if (baitTimeout) {
+            stateLog.debugAll("Charger (%N) bait timeout against shotgun target (%N), cannot safely charge, transition to APPROACH STATE",
+                client, target);
+            
+            g_ChargerStateContext[client].transitionTo(CH_STATE_APPROACH);
+            return Plugin_Changed;
+        }
         return Plugin_Continue;
     }
-    // 血量条件
+
+    // 优先检查目标是否处于易受攻击状态
+    if (isTargetVulnerable(client, target)) {
+        transitionBaitToLocked(client, target, "Non-melee target is vulnerable, forcing charge!");
+        return Plugin_Changed;
+    }
+
+    // 接着检查博弈是否超时
+    if (baitTimeout) {
+        transitionBaitToLocked(client, target, "Non-melee bait max duration exceeded, forcing charge!");
+        return Plugin_Changed;
+    }
+
+    /*
+    * 最后检查血量条件
+    * 1. 血量低于近战斩杀线时立刻冲锋
+    * 2. 血量高于近战斩杀线概率冲锋
+    */
     static int health, meleeDamageCharger;
     health = GetEntProp(client, Prop_Data, "m_iHealth");
     meleeDamageCharger = !cvMeleeDamageCharger ? DEFAULT_MELEE_DMG_CHARGER : cvMeleeDamageCharger.IntValue;
-    if (health > meleeDamageCharger && isChargerProbCharge(client)) {
-        stateLog.debugAll("Charger (%N) handling non-melee: health %d > melee damage charger %d, probabilistic charge to (%N)", client, health, meleeDamageCharger, target);
-        g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
-    } else if (health <= meleeDamageCharger) {
-        stateLog.debugAll("Charger (%N) handling non-melee: health %d <= melee damage charger %d, instant charge to (%N)", client, health, meleeDamageCharger, target);
-        g_ChargerStateContext[client].transitionTo(CH_STATE_LOCKED);
+
+    if (health <= meleeDamageCharger) {
+        transitionBaitToLocked(client, target, "Charger current health is lower than melee threshold, forcing charge!");
+        return Plugin_Changed;
     }
+
+    if (isChargerProbCharge(client)) {
+        transitionBaitToLocked(client, target, "Probabilistic charge to non-melee target, forcing charge!");
+        return Plugin_Changed;
+    }
+    
     return Plugin_Continue;
 }
 

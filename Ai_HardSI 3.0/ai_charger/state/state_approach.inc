@@ -1239,10 +1239,21 @@ stock int getChargeUnavoidableTarget(int client, int curTarget, float pos[3], fl
     return -1;
 }
 
-#define AIR_CHARGE_LINE_CORR_LERP           0.85
-#define AIR_CHARGE_LINE_CORR_LOCK_LERP      0.95
-#define AIR_CHARGE_LINE_CORR_CHARGE_LERP    0.90
-#define AIR_CHARGE_LINE_MIN_PREDICT_TIME    0.05
+/*
+ * preserveAirChargeLine 只进行空中速度修正, 避免 Charger 从 APPROACH STATE 进入其他状态时在空中飞过头
+ * 仅修正空中速度的水平分量, vel[2] 垂直速度始终保留自然的跳跃/下落速度
+ * lerp 越接近 1, 当前水平速度越迅速地转向目标预测位置, 但仍保留少量原有方向可避免瞬间反向造成抖动
+ */
+#define AIR_CHARGE_LINE_CORR_LERP           0.85    // STATE BAIT 中的常规空中修正, 强力拉回目标方向, 但为持续博弈状态保留一定转向平滑度
+#define AIR_CHARGE_LINE_CORR_LOCK_LERP      0.95    // STATE LOCKED 是冲锋前的一帧过渡阶段, 更快清除上一段连跳/路径留下的横向动量, 保证进入 Charge 时已基本对正目标
+#define AIR_CHARGE_LINE_CORR_CHARGE_LERP    0.90    // STATE CHARGING 中的空中修正, 持续追随目标预测位置，但略弱于 Lock, 避免末段预测变化使速度方向过于突兀
+
+/*
+ * 预测时间 = 与目标的水平距离 / 当前最终水平速度。
+ * 下限避免近距离或高速时预测时间趋近于零，使目标位置微小变化直接造成方向抖动
+ * 上限限制远距离, 低速或目标快速移动时的外推距离, 避免朝过于遥远的预测点过度转向
+ */
+#define AIR_CHARGE_LINE_MIN_PREDICT_TIME    0.10
 #define AIR_CHARGE_LINE_MAX_PREDICT_TIME    0.25
 
 /**
@@ -1315,6 +1326,10 @@ stock bool preserveAirChargeLine(int client, int target, bool visible, float ler
         finalSpeed = g_cvBhopMaxSpeed.FloatValue;
     }
 
+    /*
+    * 使用当前到目标的距离除以 Charger 当前的速度得到飞行到目标位置需要的时间
+    * 使用这个时间预测目标在这个时间内的预测位置
+    */
     static float predictTime;
     predictTime = dx / finalSpeed;
     if (predictTime < AIR_CHARGE_LINE_MIN_PREDICT_TIME) {
